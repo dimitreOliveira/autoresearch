@@ -23,4 +23,7 @@ colab = [
     "pyarrow",
     "requests",
     "google-genai",
+    "kernels",
+    "matplotlib",
+    "pandas",
 ]
