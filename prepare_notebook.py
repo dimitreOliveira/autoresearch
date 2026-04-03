@@ -14,20 +14,13 @@ import subprocess
 
 
 def main(repo_url, repo_dir, github_token):
-    # Clone the repository if missing
-    if not os.path.exists(repo_dir):
-        print("Cloning repository...")
-        subprocess.run(['git', 'clone', repo_url, repo_dir], capture_output=True)
-    else:
-        print(f"✅ Repository already exists at {repo_dir}")
-
     # Navigate into the project directory natively
     os.chdir(repo_dir)
     current_repo_dir = os.path.abspath(".")
 
     # Sync up dependencies through uv
     print("Synchronizing dependencies using uv...")
-    subprocess.run(['uv', 'sync'], capture_output=True)
+    subprocess.run(['uv', 'sync', '--extra', 'colab'], capture_output=True)
 
     # Configure Git
     print("Configuring Git bot identity...")
@@ -36,8 +29,7 @@ def main(repo_url, repo_dir, github_token):
 
     if github_token:
         print("Setting up GitHub authentication...")
-        auth_repo_url = repo_url.replace("https://", f"https://{github_token}@")
-        subprocess.run(['git', 'remote', 'set-url', 'origin', auth_repo_url], capture_output=True, cwd=current_repo_dir)
+        subprocess.run(['git', 'config', 'credential.helper', '!f() { echo "username=git"; echo "password=${GITHUB_TOKEN}"; }; f'], capture_output=True, cwd=current_repo_dir)
     else:
         print("Skipping GitHub authentication setup (no token provided).")
         

@@ -14,3 +14,13 @@ dependencies = [
 name = "pytorch-cu128"
 url = "https://download.pytorch.org/whl/cu128"
 explicit = true
+
+[project.optional-dependencies]
+colab = [
+    "torch>=2.0.0",
+    "rustbpe",
+    "tiktoken",
+    "pyarrow",
+    "requests",
+    "google-genai",
+]
