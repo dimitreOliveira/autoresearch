@@ -4,34 +4,34 @@ Clones the repository, installs dependencies, and configures Git.
 
 Usage:
     python prepare_notebook.py
-    python prepare_notebook.py --github-token YOUR_TOKEN
 """
 
 import argparse
-import getpass
 import os
 import subprocess
 
 
-def main(repo_dir, github_token):
-    # Navigate into the project directory natively
-    os.chdir(repo_dir)
-    current_repo_dir = os.path.abspath(".")
+def main(repo_dir):
+    # Determine the absolute repository directory
+    current_repo_dir = os.path.abspath(repo_dir)
 
     # Sync up dependencies through uv
     print("Synchronizing dependencies using uv...")
-    subprocess.run(["uv", "sync", "--extra", "colab"], capture_output=True)
+    subprocess.run(["uv", "sync", "--extra", "colab"], capture_output=True, cwd=current_repo_dir)
 
     # Configure Git
     print("Configuring Git bot identity...")
     subprocess.run(
-        ["git", "config", "user.email", "autoresearch@colab"], capture_output=True
+        ["git", "config", "user.email", "autoresearch@colab"], capture_output=True, cwd=current_repo_dir
     )
     subprocess.run(
-        ["git", "config", "user.name", "AutoResearch Bot"], capture_output=True
+        ["git", "config", "user.name", "AutoResearch Bot"], capture_output=True, cwd=current_repo_dir
     )
 
-    if github_token:
+    # Use GITHUB_TOKEN from current environment if it exists
+    token_to_use = os.environ.get("GITHUB_TOKEN")
+
+    if token_to_use:
         print("Setting up GitHub authentication...")
         subprocess.run(
             [
@@ -52,32 +52,11 @@ def main(repo_dir, github_token):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Prepare the notebook environment")
     parser.add_argument(
-        "--repo-url",
-        type=str,
-        default="https://github.com/dimitreOliveira/autoresearch.git",
-        help="The repository URL to clone",
-    )
-    parser.add_argument(
         "--repo-dir",
         type=str,
         default="autoresearch",
         help="The directory to clone the repository into",
     )
-    parser.add_argument(
-        "--github-token", type=str, default=None, help="GitHub token for authentication"
-    )
-
     args = parser.parse_args()
 
-    token = args.github_token
-    if token is None:
-        try:
-            token_input = getpass.getpass(
-                "Please enter your GitHub Token manually (or press Enter to skip): "
-            )
-            if token_input.strip() != "":
-                token = token_input.strip()
-        except EOFError:
-            pass
-
-    main(args.repo_url, args.repo_dir, token)
+    main(args.repo_dir)
