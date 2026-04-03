@@ -9,16 +9,16 @@ Usage:
 Data and tokenizer are stored in ~/.cache/autoresearch/.
 """
 
+import argparse
+import math
 import os
+import pickle
 import sys
 import time
-import math
-import argparse
-import pickle
 from multiprocessing import Pool
 
-import requests
 import pyarrow.parquet as pq
+import requests
 import rustbpe
 import tiktoken
 import torch
