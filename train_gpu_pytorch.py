@@ -17,16 +17,7 @@ from dataclasses import asdict, dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from kernels import get_kernel
-
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, evaluate_bpb, make_dataloader
-
-cap = torch.cuda.get_device_capability()
-# varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
-repo = (
-    "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
-)
-fa3 = get_kernel(repo).flash_attn_interface
 
 
 # ---------------------------------------------------------------------------
@@ -99,8 +90,23 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
 
-        y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
-        y = y.contiguous().view(B, T, -1)
+        # PyTorch SDPA requires (B, num_heads, T, head_dim)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+
+        # Use explicitly constructed sliding window if we have a short window
+        if window_size is not None and window_size[0] >= 0 and window_size[0] < T:
+            # sliding window masked SDPA
+            mask = torch.ones(T, T, dtype=torch.bool, device=x.device)
+            mask = torch.tril(mask)
+            mask = torch.triu(mask, diagonal=1 - window_size[0])
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+        else:
+            # standard causal SDPA (uses FA2 under the hood efficiently)
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
+        y = y.transpose(1, 2).contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
 
@@ -189,10 +195,10 @@ class GPT(nn.Module):
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.cos, self.sin = cos, sin
-        # Cast embeddings to bf16
-        self.transformer.wte.to(dtype=torch.bfloat16)
+        # Cast embeddings to DTYPE
+        self.transformer.wte.to(dtype=DTYPE)
         for ve in self.value_embeds.values():
-            ve.to(dtype=torch.bfloat16)
+            ve.to(dtype=DTYPE)
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
         if device is None:
@@ -202,7 +208,7 @@ class GPT(nn.Module):
         t = torch.arange(seq_len, dtype=torch.float32, device=device)
         freqs = torch.outer(t, inv_freq)
         cos, sin = freqs.cos(), freqs.sin()
-        cos, sin = cos.bfloat16(), sin.bfloat16()
+        cos, sin = cos.to(DTYPE), sin.to(DTYPE)
         cos, sin = cos[None, :, None, :], sin[None, :, None, :]
         return cos, sin
 
@@ -571,8 +577,29 @@ WARMDOWN_RATIO = 0.5  # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.0  # final LR as fraction of initial
 
 # Model size
+SEQUENCE_LEN = 2048
 DEPTH = 8  # number of transformer layers
 DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
+EVAL_BATCH_SIZE = 128
+DTYPE = torch.bfloat16
+
+# GPU hardware detection and hyperparameter adjustments
+if torch.cuda.is_available():
+    gpu_name = torch.cuda.get_device_name()
+    cap = torch.cuda.get_device_capability()
+    print(f"Detected GPU: {gpu_name} (Compute Capability {cap[0]}.{cap[1]})")
+
+    if cap[0] < 8:
+        print("Compute Capability < 8 detected, switching to float16 (no native bfloat16)")
+        DTYPE = torch.float16
+
+    if "T4" in gpu_name or cap == (7, 5):
+        SEQUENCE_LEN = 256
+        DEPTH = 4
+        TOTAL_BATCH_SIZE = 2**14
+        DEVICE_BATCH_SIZE = 64
+        EVAL_BATCH_SIZE = 16
+        print(f"T4 detected, scaling down hyperparameters: seq_len={SEQUENCE_LEN}, depth={DEPTH}, batch_size={TOTAL_BATCH_SIZE}")
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
@@ -583,7 +610,7 @@ torch.manual_seed(42)
 torch.cuda.manual_seed(42)
 torch.set_float32_matmul_precision("high")
 device = torch.device("cuda")
-autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=DTYPE)
 H100_BF16_PEAK_FLOPS = 989.5e12
 
 tokenizer = Tokenizer.from_directory()
@@ -596,7 +623,7 @@ def build_model_config(depth):
     model_dim = ((base_dim + HEAD_DIM - 1) // HEAD_DIM) * HEAD_DIM
     num_heads = model_dim // HEAD_DIM
     return GPTConfig(
-        sequence_len=MAX_SEQ_LEN,
+        sequence_len=SEQUENCE_LEN,
         vocab_size=vocab_size,
         n_layer=depth,
         n_head=num_heads,
@@ -622,7 +649,7 @@ num_params = param_counts["total"]
 num_flops_per_token = model.estimate_flops()
 print(f"Estimated FLOPs per token: {num_flops_per_token:e}")
 
-tokens_per_fwdbwd = DEVICE_BATCH_SIZE * MAX_SEQ_LEN
+tokens_per_fwdbwd = DEVICE_BATCH_SIZE * SEQUENCE_LEN
 assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
 grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
 
@@ -637,7 +664,7 @@ optimizer = model.setup_optimizer(
 
 model = torch.compile(model, dynamic=False)
 
-train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
+train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, SEQUENCE_LEN, "train")
 x, y, epoch = next(train_loader)  # prefetch first batch
 
 print(f"Time budget: {TIME_BUDGET}s")
@@ -748,7 +775,7 @@ total_tokens = step * TOTAL_BATCH_SIZE
 # Final eval
 model.eval()
 with autocast_ctx:
-    val_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
+    val_bpb = evaluate_bpb(model, tokenizer, EVAL_BATCH_SIZE, seq_len=MAX_SEQ_LEN)
 
 # Final summary
 t_end = time.time()
