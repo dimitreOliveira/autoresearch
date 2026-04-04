@@ -568,7 +568,7 @@ MATRIX_LR = 0.04  # learning rate for matrix parameters (Muon)
 SCALAR_LR = 0.5  # learning rate for per-layer scalars (Adam)
 WEIGHT_DECAY = 0.2  # cautious weight decay for Muon
 ADAM_BETAS = (0.8, 0.95)  # Adam beta1, beta2
-WARMUP_RATIO = 0.05  # fraction of time budget for LR warmup
+WARMUP_RATIO = 0.1  # fraction of time budget for LR warmup
 WARMDOWN_RATIO = 0.5  # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.0  # final LR as fraction of initial
 
@@ -590,10 +590,10 @@ if torch.cuda.is_available():
         DTYPE = torch.float16
 
     if "T4" in gpu_name or cap == (7, 5):
-        SEQUENCE_LEN = 256
-        DEPTH = 4
-        TOTAL_BATCH_SIZE = 2**14
-        DEVICE_BATCH_SIZE = 64
+        SEQUENCE_LEN = 512
+        DEPTH = 8
+        TOTAL_BATCH_SIZE = 65536
+        DEVICE_BATCH_SIZE = 32
         EVAL_BATCH_SIZE = 16
         print(f"T4 detected, scaling down hyperparameters: seq_len={SEQUENCE_LEN}, depth={DEPTH}, batch_size={TOTAL_BATCH_SIZE}")
 
@@ -798,4 +798,3 @@ print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
 print(f"num_steps:        {step}")
 print(f"num_params_M:     {num_params / 1e6:.1f}")
 print(f"depth:            {DEPTH}")
-
