@@ -593,9 +593,10 @@ if torch.cuda.is_available():
         SEQUENCE_LEN = 512
         DEPTH = 8
         TOTAL_BATCH_SIZE = 65536
-        DEVICE_BATCH_SIZE = 32
-        EVAL_BATCH_SIZE = 16
-        print(f"T4 detected, scaling down hyperparameters: seq_len={SEQUENCE_LEN}, depth={DEPTH}, batch_size={TOTAL_BATCH_SIZE}")
+        DEVICE_BATCH_SIZE = 128
+        EVAL_BATCH_SIZE = 64
+        WINDOW_PATTERN = "L"
+        print(f"T4 detected, scaling down hyperparameters: seq_len={SEQUENCE_LEN}, depth={DEPTH}, batch_size={TOTAL_BATCH_SIZE}, window={WINDOW_PATTERN}")
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
@@ -607,6 +608,7 @@ torch.cuda.manual_seed(42)
 torch.set_float32_matmul_precision("high")
 device = torch.device("cuda")
 autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=DTYPE)
+scaler = torch.cuda.amp.GradScaler(enabled=(DTYPE == torch.float16))
 H100_BF16_PEAK_FLOPS = 989.5e12
 
 tokenizer = Tokenizer.from_directory()
@@ -705,7 +707,7 @@ while True:
             loss = model(x, y)
         train_loss = loss.detach()
         loss = loss / grad_accum_steps
-        loss.backward()
+        scaler.scale(loss).backward()
         x, y, epoch = next(train_loader)
 
     # Progress and schedules
@@ -718,7 +720,9 @@ while True:
         if group["kind"] == "muon":
             group["momentum"] = muon_momentum
             group["weight_decay"] = muon_weight_decay
-    optimizer.step()
+            
+    scaler.step(optimizer)
+    scaler.update()
     model.zero_grad(set_to_none=True)
 
     train_loss_f = train_loss.item()
