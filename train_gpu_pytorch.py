@@ -195,10 +195,6 @@ class GPT(nn.Module):
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.cos, self.sin = cos, sin
-        # Cast embeddings to DTYPE
-        self.transformer.wte.to(dtype=DTYPE)
-        for ve in self.value_embeds.values():
-            ve.to(dtype=DTYPE)
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
         if device is None:
@@ -423,7 +419,7 @@ def muon_step_fused(
     momentum_buffer.lerp_(stacked_grads, 1 - momentum)
     g = stacked_grads.lerp_(momentum_buffer, momentum)
     # Polar express orthogonalization
-    X = g.bfloat16()
+    X = g.float()
     X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.02 + 1e-6)
     if g.size(-2) > g.size(-1):
         for a, b, c in polar_express_coeffs[:ns_steps]:
@@ -482,8 +478,8 @@ class MuonAdamW(torch.optim.Optimizer):
             state = self.state[p]
             if not state:
                 state["step"] = 0
-                state["exp_avg"] = torch.zeros_like(p)
-                state["exp_avg_sq"] = torch.zeros_like(p)
+                state["exp_avg"] = torch.zeros_like(p, dtype=torch.float32)
+                state["exp_avg_sq"] = torch.zeros_like(p, dtype=torch.float32)
             state["step"] += 1
             self._adamw_step_t.fill_(state["step"])
             self._adamw_lr_t.fill_(group["lr"])
@@ -572,7 +568,7 @@ MATRIX_LR = 0.04  # learning rate for matrix parameters (Muon)
 SCALAR_LR = 0.5  # learning rate for per-layer scalars (Adam)
 WEIGHT_DECAY = 0.2  # cautious weight decay for Muon
 ADAM_BETAS = (0.8, 0.95)  # Adam beta1, beta2
-WARMUP_RATIO = 0.0  # fraction of time budget for LR warmup
+WARMUP_RATIO = 0.05  # fraction of time budget for LR warmup
 WARMDOWN_RATIO = 0.5  # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.0  # final LR as fraction of initial
 
@@ -802,3 +798,4 @@ print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
 print(f"num_steps:        {step}")
 print(f"num_params_M:     {num_params / 1e6:.1f}")
 print(f"depth:            {DEPTH}")
+
