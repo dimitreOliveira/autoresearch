@@ -17,8 +17,8 @@ from dataclasses import asdict, dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, evaluate_bpb, make_dataloader
 
+from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, evaluate_bpb, make_dataloader
 
 # ---------------------------------------------------------------------------
 # GPT Model
@@ -590,7 +590,9 @@ if torch.cuda.is_available():
     print(f"Detected GPU: {gpu_name} (Compute Capability {cap[0]}.{cap[1]})")
 
     if cap[0] < 8:
-        print("Compute Capability < 8 detected, switching to float16 (no native bfloat16)")
+        print(
+            "Compute Capability < 8 detected, switching to float16 (no native bfloat16)"
+        )
         DTYPE = torch.float16
 
     if "T4" in gpu_name or cap == (7, 5):
@@ -599,7 +601,9 @@ if torch.cuda.is_available():
         TOTAL_BATCH_SIZE = 2**14
         DEVICE_BATCH_SIZE = 64
         EVAL_BATCH_SIZE = 16
-        print(f"T4 detected, scaling down hyperparameters: seq_len={SEQUENCE_LEN}, depth={DEPTH}, batch_size={TOTAL_BATCH_SIZE}")
+        print(
+            f"T4 detected, scaling down hyperparameters: seq_len={SEQUENCE_LEN}, depth={DEPTH}, batch_size={TOTAL_BATCH_SIZE}"
+        )
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader

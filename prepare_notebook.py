@@ -17,15 +17,21 @@ def main(repo_dir):
 
     # Sync up dependencies through uv
     print("Synchronizing dependencies using uv...")
-    subprocess.run(["uv", "sync", "--extra", "colab"], capture_output=True, cwd=current_repo_dir)
+    subprocess.run(
+        ["uv", "sync", "--extra", "colab"], capture_output=True, cwd=current_repo_dir
+    )
 
     # Configure Git
     print("Configuring Git bot identity...")
     subprocess.run(
-        ["git", "config", "user.email", "autoresearch@colab"], capture_output=True, cwd=current_repo_dir
+        ["git", "config", "user.email", "autoresearch@colab"],
+        capture_output=True,
+        cwd=current_repo_dir,
     )
     subprocess.run(
-        ["git", "config", "user.name", "AutoResearch Bot"], capture_output=True, cwd=current_repo_dir
+        ["git", "config", "user.name", "AutoResearch Bot"],
+        capture_output=True,
+        cwd=current_repo_dir,
     )
 
     # Use GITHUB_TOKEN from current environment if it exists
