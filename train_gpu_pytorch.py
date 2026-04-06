@@ -598,7 +598,9 @@ if torch.cuda.is_available():
         DEVICE_BATCH_SIZE = 128
         EVAL_BATCH_SIZE = 64
         WINDOW_PATTERN = "L"
-        print(f"T4 detected, scaling down hyperparameters: seq_len={SEQUENCE_LEN}, depth={DEPTH}, batch_size={TOTAL_BATCH_SIZE}, window={WINDOW_PATTERN}")
+        print(
+            f"T4 detected, scaling down hyperparameters: seq_len={SEQUENCE_LEN}, depth={DEPTH}, batch_size={TOTAL_BATCH_SIZE}, window={WINDOW_PATTERN}"
+        )
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
@@ -722,7 +724,7 @@ while True:
         if group["kind"] == "muon":
             group["momentum"] = muon_momentum
             group["weight_decay"] = muon_weight_decay
-            
+
     scaler.step(optimizer)
     scaler.update()
     model.zero_grad(set_to_none=True)
