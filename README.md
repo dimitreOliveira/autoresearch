@@ -13,7 +13,7 @@ The repo is deliberately kept small and primarily revolves around these core fil
 - **`notebook_runner.ipynb`** — the central orchestrator notebook meant to be run in Colab. It automates the LLM API calls, handles the experiment execution loop, and manages creating automated Pull Requests.
 - **`prepare_notebook.py`** — a utility script used by the notebook to prepare the environment (clones the repo, installs dependencies via `uv`, and configures Git credentials).
 - **`prepare.py`** — fixed constants, one-time data prep (downloads training data, trains a BPE tokenizer), and runtime utilities (dataloader, evaluation). Not modified.
-- **`train.py`** — the single file the agent edits. Contains the full GPT model, optimizer (Muon + AdamW), and training loop. Everything is fair game: architecture, hyperparameters, optimizer, batch size, etc. **This file is edited and iterated on by the agent**.
+- **`train_*.py`** — the single file the agent edits. Contains the full GPT model, optimizer (Muon + AdamW), and training loop. Everything is fair game: architecture, hyperparameters, optimizer, batch size, etc. **This file is edited and iterated on by the agent**.
 - **`program.md`** — baseline instructions for one agent. Point your agent here and let it go. **This file is edited and iterated on by the human**.
 
 By design, training runs for a **fixed 5-minute time budget** (wall clock, excluding startup/compilation), regardless of the details of your compute. The metric is **val_bpb** (validation bits per byte) — lower is better, and vocab-size-independent so architectural changes are fairly compared.
@@ -50,7 +50,7 @@ The `program.md` file serves as essentially a super lightweight "skill" providin
 notebook_runner.ipynb — central orchestrator for Colab
 prepare_notebook.py   — sets up the Colab environment and Git PR workflow
 prepare.py            — constants, data prep + runtime utilities (do not modify)
-train.py              — model, optimizer, training loop (agent modifies this)
+train_*.py              — model, optimizer, training loop (agent modifies this)
 program.md            — agent instructions
 pyproject.toml        — dependencies
 ```
