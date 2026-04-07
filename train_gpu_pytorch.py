@@ -580,10 +580,24 @@ EVAL_BATCH_SIZE = 128
 DTYPE = torch.bfloat16
 
 # GPU hardware detection and hyperparameter adjustments
+PEAK_FLOPS = 989.5e12  # Default to H100
 if torch.cuda.is_available():
     gpu_name = torch.cuda.get_device_name()
     cap = torch.cuda.get_device_capability()
     print(f"Detected GPU: {gpu_name} (Compute Capability {cap[0]}.{cap[1]})")
+
+    if "H100" in gpu_name:
+        PEAK_FLOPS = 989.5e12
+    elif "A100" in gpu_name:
+        PEAK_FLOPS = 312.0e12
+    elif "L4" in gpu_name:
+        PEAK_FLOPS = 121.0e12
+    elif "V100" in gpu_name:
+        PEAK_FLOPS = 125.0e12
+    elif "T4" in gpu_name:
+        PEAK_FLOPS = 65.0e12
+    else:
+        print(f"Warning: Unknown GPU '{gpu_name}', defaulting PEAK_FLOPS to H100. MFU metrics may be inaccurate.")
 
     if cap[0] < 8:
         print(
@@ -612,8 +626,7 @@ torch.cuda.manual_seed(42)
 torch.set_float32_matmul_precision("high")
 device = torch.device("cuda")
 autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=DTYPE)
-scaler = torch.cuda.amp.GradScaler(enabled=(DTYPE == torch.float16))
-H100_BF16_PEAK_FLOPS = 989.5e12
+scaler = torch.amp.GradScaler("cuda", enabled=(DTYPE == torch.float16))
 
 tokenizer = Tokenizer.from_directory()
 vocab_size = tokenizer.get_vocab_size()
@@ -749,7 +762,7 @@ while True:
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta ** (step + 1))
     pct_done = 100 * progress
     tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
-    mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / H100_BF16_PEAK_FLOPS
+    mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / PEAK_FLOPS
     remaining = max(0, TIME_BUDGET - total_training_time)
 
     print(
@@ -790,7 +803,7 @@ steady_state_mfu = (
     * TOTAL_BATCH_SIZE
     * (step - 10)
     / total_training_time
-    / H100_BF16_PEAK_FLOPS
+    / PEAK_FLOPS
     if total_training_time > 0
     else 0
 )
