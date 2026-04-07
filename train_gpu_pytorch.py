@@ -596,6 +596,8 @@ if torch.cuda.is_available():
         PEAK_FLOPS = 125.0e12
     elif "T4" in gpu_name:
         PEAK_FLOPS = 65.0e12
+    else:
+        print(f"Warning: Unknown GPU '{gpu_name}', defaulting PEAK_FLOPS to H100. MFU metrics may be inaccurate.")
 
     if cap[0] < 8:
         print(
