@@ -1,7 +1,7 @@
 """
-Autoresearch pretraining script. Single-GPU, single-file.
+Autoresearch pretraining script. Single-TPU, single-file.
 Cherry-picked and simplified from nanochat.
-Usage: uv run train_gpu_pytorch.py
+Usage: uv run train_tpu_pytorch.py
 """
 
 import os
@@ -17,6 +17,7 @@ from dataclasses import asdict, dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch_xla.core.xla_model as xm
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, evaluate_bpb, make_dataloader
 
@@ -375,7 +376,7 @@ class GPT(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Optimizer (MuonAdamW, single GPU only)
+# Optimizer (MuonAdamW, single TPU only)
 # ---------------------------------------------------------------------------
 
 polar_express_coeffs = [
@@ -579,44 +580,30 @@ DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
 EVAL_BATCH_SIZE = 128
 DTYPE = torch.bfloat16
 
-# GPU hardware detection and hyperparameter adjustments
-PEAK_FLOPS = 989.5e12  # Default to H100
-if torch.cuda.is_available():
-    gpu_name = torch.cuda.get_device_name()
-    cap = torch.cuda.get_device_capability()
-    print(f"Detected GPU: {gpu_name} (Compute Capability {cap[0]}.{cap[1]})")
+# TPU hardware detection and hyperparameter adjustments
+PEAK_FLOPS = 197.0e12  # Default to TPU v5e
 
-    if "H100" in gpu_name:
-        PEAK_FLOPS = 989.5e12
-    elif "A100" in gpu_name:
-        PEAK_FLOPS = 312.0e12
-    elif "L4" in gpu_name:
-        PEAK_FLOPS = 121.0e12
-    elif "V100" in gpu_name:
-        PEAK_FLOPS = 125.0e12
-    elif "T4" in gpu_name:
-        PEAK_FLOPS = 65.0e12
+try:
+    tpu_env = os.environ.get("TPU_NAME", "")
+    tpu_accel_type = os.environ.get("TPU_ACCELERATOR_TYPE", "")
+
+    if "v6e" in tpu_accel_type or "v6e" in tpu_env:
+        PEAK_FLOPS = 918.0e12
+        print("Detected TPU v6e (Trillium)")
+    elif "v5e" in tpu_accel_type or "v5e" in tpu_env:
+        PEAK_FLOPS = 197.0e12
+        print("Detected TPU v5e")
+    elif "v2" in tpu_accel_type or "v2" in tpu_env:
+        PEAK_FLOPS = 45.0e12
+        print("Detected TPU v2")
     else:
         print(
-            f"Warning: Unknown GPU '{gpu_name}', defaulting PEAK_FLOPS to H100. MFU metrics may be inaccurate."
+            f"Warning: Unknown TPU type '{tpu_accel_type}', defaulting to TPU v5e peak flops."
         )
+except Exception:
+    pass
 
-    if cap[0] < 8:
-        print(
-            "Compute Capability < 8 detected, switching to float16 (no native bfloat16)"
-        )
-        DTYPE = torch.float16
-
-    if "T4" in gpu_name or cap == (7, 5):
-        SEQUENCE_LEN = 512
-        DEPTH = 8
-        TOTAL_BATCH_SIZE = 65536
-        DEVICE_BATCH_SIZE = 128
-        EVAL_BATCH_SIZE = 64
-        WINDOW_PATTERN = "L"
-        print(
-            f"T4 detected, scaling down hyperparameters: seq_len={SEQUENCE_LEN}, depth={DEPTH}, batch_size={TOTAL_BATCH_SIZE}, window={WINDOW_PATTERN}"
-        )
+DTYPE = torch.bfloat16
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
@@ -624,11 +611,9 @@ if torch.cuda.is_available():
 
 t_start = time.time()
 torch.manual_seed(42)
-torch.cuda.manual_seed(42)
 torch.set_float32_matmul_precision("high")
-device = torch.device("cuda")
-autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=DTYPE)
-scaler = torch.amp.GradScaler("cuda", enabled=(DTYPE == torch.float16))
+device = xm.xla_device()
+autocast_ctx = torch.amp.autocast(device_type="xla", dtype=DTYPE)
 
 tokenizer = Tokenizer.from_directory()
 vocab_size = tokenizer.get_vocab_size()
@@ -653,10 +638,9 @@ def build_model_config(depth):
 config = build_model_config(DEPTH)
 print(f"Model config: {asdict(config)}")
 
-with torch.device("meta"):
-    model = GPT(config)
-model.to_empty(device=device)
+model = GPT(config)
 model.init_weights()
+model.to(device)
 
 param_counts = model.num_scaling_params()
 print("Parameter counts:")
@@ -681,7 +665,9 @@ optimizer = model.setup_optimizer(
 
 model = torch.compile(model, dynamic=False)
 
-train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, SEQUENCE_LEN, "train")
+train_loader = make_dataloader(
+    tokenizer, DEVICE_BATCH_SIZE, SEQUENCE_LEN, "train", device="cpu"
+)
 x, y, epoch = next(train_loader)  # prefetch first batch
 
 print(f"Time budget: {TIME_BUDGET}s")
@@ -719,14 +705,17 @@ total_training_time = 0
 step = 0
 
 while True:
-    torch.cuda.synchronize()
+    xm.wait_device_ops()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
+        # Move CPU tensors to XLA device
+        device_x = x.to(device, non_blocking=True)
+        device_y = y.to(device, non_blocking=True)
         with autocast_ctx:
-            loss = model(x, y)
+            loss = model(device_x, device_y)
         train_loss = loss.detach()
         loss = loss / grad_accum_steps
-        scaler.scale(loss).backward()
+        loss.backward()
         x, y, epoch = next(train_loader)
 
     # Progress and schedules
@@ -740,8 +729,8 @@ while True:
             group["momentum"] = muon_momentum
             group["weight_decay"] = muon_weight_decay
 
-    scaler.step(optimizer)
-    scaler.update()
+    xm.optimizer_step(optimizer)
+    xm.mark_step()
     model.zero_grad(set_to_none=True)
 
     train_loss_f = train_loss.item()
@@ -751,7 +740,7 @@ while True:
         print("FAIL")
         exit(1)
 
-    torch.cuda.synchronize()
+    xm.wait_device_ops()
     t1 = time.time()
     dt = t1 - t0
 
@@ -794,7 +783,9 @@ total_tokens = step * TOTAL_BATCH_SIZE
 # Final eval
 model.eval()
 with autocast_ctx:
-    val_bpb = evaluate_bpb(model, tokenizer, EVAL_BATCH_SIZE, seq_len=MAX_SEQ_LEN)
+    val_bpb = evaluate_bpb(
+        model, tokenizer, EVAL_BATCH_SIZE, seq_len=MAX_SEQ_LEN, device=device
+    )
 
 # Final summary
 t_end = time.time()
@@ -809,7 +800,7 @@ steady_state_mfu = (
     if total_training_time > 0
     else 0
 )
-peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
+peak_vram_mb = 0.0
 
 print("---")
 print(f"val_bpb:          {val_bpb:.6f}")

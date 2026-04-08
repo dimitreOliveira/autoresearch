@@ -15,11 +15,27 @@ def main(repo_dir):
     # Determine the absolute repository directory
     current_repo_dir = os.path.abspath(repo_dir)
 
-    # Sync up dependencies through uv
-    print("Synchronizing dependencies using uv...")
-    subprocess.run(
-        ["uv", "sync", "--extra", "colab"], capture_output=True, cwd=current_repo_dir
-    )
+    # Determine if we are on a Colab TPU
+    tpu_env = os.environ.get("COLAB_TPU_ADDR") or os.environ.get("TPU_NAME")
+
+    if tpu_env:
+        print(
+            "TPU runtime detected. Installing dependencies into system Python to preserve torch_xla..."
+        )
+        # uv pip install --system installs into Colab's default environment
+        subprocess.run(
+            ["uv", "pip", "install", "--system", "-e", ".[colab]"],
+            capture_output=True,
+            cwd=current_repo_dir,
+        )
+    else:
+        # Sync up dependencies through uv in an isolated venv
+        print("Synchronizing dependencies using uv...")
+        subprocess.run(
+            ["uv", "sync", "--extra", "colab"],
+            capture_output=True,
+            cwd=current_repo_dir,
+        )
 
     # Configure Git
     print("Configuring Git bot identity...")
