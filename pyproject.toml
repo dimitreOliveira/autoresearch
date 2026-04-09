@@ -16,8 +16,20 @@ url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
 [project.optional-dependencies]
-colab = [
+colab_gpu = [
     "torch>=2.0.0",
+    "rustbpe",
+    "tiktoken",
+    "pyarrow",
+    "requests",
+    "google-genai",
+    "kernels",
+    "matplotlib",
+    "pandas",
+]
+colab_tpu = [
+    "torch>=2.0.0",
+    "torch_xla[tpu]>=2.5.0",
     "rustbpe",
     "tiktoken",
     "pyarrow",

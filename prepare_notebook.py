@@ -47,21 +47,20 @@ def main(repo_dir):
 
     if tpu_env:
         print(
-            "TPU runtime detected. Installing dependencies into system Python to preserve torch_xla..."
+            "TPU runtime detected. Synchronizing dependencies with torch_xla using uv..."
         )
-        # uv pip install --system installs into Colab's default environment
         subprocess.run(
-            ["uv", "pip", "install", "--system", "-e", ".[colab]"],
-            capture_output=True,
+            ["uv", "sync", "--extra", "colab_tpu"],
             cwd=current_repo_dir,
+            check=True,
         )
     else:
         # Sync up dependencies through uv in an isolated venv
         print("Synchronizing dependencies using uv...")
         subprocess.run(
-            ["uv", "sync", "--extra", "colab"],
-            capture_output=True,
+            ["uv", "sync", "--extra", "colab_gpu"],
             cwd=current_repo_dir,
+            check=True,
         )
 
     # Configure Git
