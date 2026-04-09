@@ -388,7 +388,7 @@ polar_express_coeffs = [
 ]
 
 
-@torch.compile(dynamic=False, fullgraph=True)
+@torch.compile(backend="openxla", dynamic=False, fullgraph=True)
 def adamw_step_fused(
     p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t
 ):
@@ -402,7 +402,7 @@ def adamw_step_fused(
     p.add_(exp_avg / denom, alpha=-step_size)
 
 
-@torch.compile(dynamic=False, fullgraph=True)
+@torch.compile(backend="openxla", dynamic=False, fullgraph=True)
 def muon_step_fused(
     stacked_grads,
     stacked_params,
@@ -663,7 +663,7 @@ optimizer = model.setup_optimizer(
     weight_decay=WEIGHT_DECAY,
 )
 
-model = torch.compile(model, dynamic=False)
+model = torch.compile(model, backend="openxla", dynamic=False)
 
 train_loader = make_dataloader(
     tokenizer, DEVICE_BATCH_SIZE, SEQUENCE_LEN, "train", device="cpu"
@@ -800,7 +800,8 @@ steady_state_mfu = (
     if total_training_time > 0
     else 0
 )
-peak_vram_mb = 0.0
+mem_info = xm.get_memory_info(device)
+peak_vram_mb = (mem_info["kb_total"] - mem_info["kb_free"]) / 1024
 
 print("---")
 print(f"val_bpb:          {val_bpb:.6f}")
