@@ -703,10 +703,10 @@ t_start_training = time.time()
 smooth_train_loss = 0
 total_training_time = 0
 step = 0
+t0 = time.time()
+dt = 0
 
 while True:
-    xm.wait_device_ops()
-    t0 = time.time()
     for micro_step in range(grad_accum_steps):
         # Move CPU tensors to XLA device
         device_x = x.to(device, non_blocking=True)
@@ -733,34 +733,39 @@ while True:
     xm.mark_step()
     model.zero_grad(set_to_none=True)
 
-    train_loss_f = train_loss.item()
+    if step % 10 == 0:
+        train_loss_f = train_loss.item()
 
-    # Fast fail: abort if loss is exploding or NaN
-    if math.isnan(train_loss_f) or train_loss_f > 100:
-        print("FAIL")
-        exit(1)
+        # Fast fail: abort if loss is exploding or NaN
+        if math.isnan(train_loss_f) or train_loss_f > 100:
+            print("FAIL")
+            exit(1)
 
-    xm.wait_device_ops()
-    t1 = time.time()
-    dt = t1 - t0
+        t1 = time.time()
+        dt = (t1 - t0) / 10 if step > 0 else 0
+        t0 = t1
+
+        # Logging
+        ema_beta = 0.9
+        smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
+        debiased_smooth_loss = smooth_train_loss / (1 - ema_beta ** ((step // 10) + 1))
+        pct_done = 100 * progress
+        tok_per_sec = int(TOTAL_BATCH_SIZE / dt) if dt > 0 else 0
+        mfu = (
+            100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / PEAK_FLOPS
+            if dt > 0
+            else 0
+        )
+        remaining = max(0, TIME_BUDGET - total_training_time)
+
+        print(
+            f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ",
+            end="",
+            flush=True,
+        )
 
     if step > 10:
         total_training_time += dt
-
-    # Logging
-    ema_beta = 0.9
-    smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
-    debiased_smooth_loss = smooth_train_loss / (1 - ema_beta ** (step + 1))
-    pct_done = 100 * progress
-    tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
-    mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / PEAK_FLOPS
-    remaining = max(0, TIME_BUDGET - total_training_time)
-
-    print(
-        f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ",
-        end="",
-        flush=True,
-    )
 
     # GC management (Python's GC causes ~500ms stalls)
     if step == 0:
