@@ -780,7 +780,9 @@ steady_state_mfu = (
     else 0
 )
 mem_info = xm.get_memory_info(device)
-peak_vram_mb = (mem_info["kb_total"] - mem_info["kb_free"]) / 1024
+kb_total = mem_info.get("kb_total", 0)
+kb_free = mem_info.get("kb_free", 0)
+peak_vram_mb = (kb_total - kb_free) / 1024 if kb_total > 0 else 0
 
 print("---")
 print(f"val_bpb:          {val_bpb:.6f}")
