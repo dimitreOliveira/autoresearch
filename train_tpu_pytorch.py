@@ -537,7 +537,7 @@ HEAD_DIM = 128  # target head dimension for attention
 WINDOW_PATTERN = "SSSL"  # sliding window pattern: L=full, S=half context
 
 # Optimization
-TOTAL_BATCH_SIZE = 2**19  # ~524K tokens per optimizer step
+TOTAL_BATCH_SIZE = 2**16  # ~65K tokens per optimizer step
 EMBEDDING_LR = 0.6  # learning rate for token embeddings (Adam)
 UNEMBEDDING_LR = 0.004  # learning rate for lm_head (Adam)
 MATRIX_LR = 0.04  # learning rate for matrix parameters (Muon)
@@ -780,7 +780,9 @@ steady_state_mfu = (
     else 0
 )
 mem_info = xm.get_memory_info(device)
-peak_vram_mb = (mem_info["kb_total"] - mem_info["kb_free"]) / 1024
+kb_total = mem_info.get("kb_total", 0)
+kb_free = mem_info.get("kb_free", 0)
+peak_vram_mb = (kb_total - kb_free) / 1024 if kb_total > 0 else 0
 
 print("---")
 print(f"val_bpb:          {val_bpb:.6f}")
