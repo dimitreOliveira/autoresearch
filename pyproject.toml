@@ -39,3 +39,7 @@ colab_tpu = [
     "matplotlib",
     "pandas",
 ]
+
+[tool.setuptools]
+packages = []
+py-modules = []

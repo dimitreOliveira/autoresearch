@@ -83,9 +83,10 @@ class CausalSelfAttention(nn.Module):
 
         # Value residual (ResFormer): mix in value embedding with input-dependent gate per head
         if ve is not None:
+            v_dtype = v.dtype
             ve = ve.view(B, T, self.n_kv_head, self.head_dim)
             gate = 2 * torch.sigmoid(self.ve_gate(x[..., : self.ve_gate_channels]))
-            v = v + gate.unsqueeze(-1) * ve
+            v = (v + gate.unsqueeze(-1) * ve).to(v_dtype)
 
         cos, sin = cos_sin
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
@@ -576,8 +577,8 @@ FINAL_LR_FRAC = 0.0  # final LR as fraction of initial
 # Model size
 SEQUENCE_LEN = 2048
 DEPTH = 8  # number of transformer layers
-DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
-EVAL_BATCH_SIZE = 128
+DEVICE_BATCH_SIZE = 16  # per-device batch size (reduce if OOM)
+EVAL_BATCH_SIZE = 16
 DTYPE = torch.bfloat16
 
 # TPU hardware detection and hyperparameter adjustments

@@ -316,7 +316,8 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000, device="cuda"):
 
     # Pre-allocate buffers: [inputs (B*T) | targets (B*T)]
     row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
-    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=True)
+    pin_mem = torch.cuda.is_available() and str(device) != "cpu" and "xla" not in str(device)
+    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=pin_mem)
     gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device=device)
     cpu_inputs = cpu_buffer[: B * T].view(B, T)
     cpu_targets = cpu_buffer[B * T :].view(B, T)

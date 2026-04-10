@@ -50,8 +50,7 @@ def main(repo_dir):
             "TPU runtime detected. Synchronizing dependencies with torch_xla using uv..."
         )
         subprocess.run(
-            # ["uv", "sync", "--extra", "colab_tpu"],
-            ["uv", "pip", "install", "--system", "--extra", "colab_tpu", "."],
+            ["uv", "pip", "install", "--system", ".[colab_tpu]"],
             cwd=current_repo_dir,
             check=True,
         )
