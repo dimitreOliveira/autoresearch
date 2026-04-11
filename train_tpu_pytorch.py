@@ -17,6 +17,7 @@ from dataclasses import asdict, dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch_xla
 import torch_xla.core.xla_model as xm
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, evaluate_bpb, make_dataloader
@@ -587,7 +588,7 @@ DTYPE = torch.bfloat16
 t_start = time.time()
 torch.manual_seed(42)
 torch.set_float32_matmul_precision("high")
-device = xm.xla_device()
+device = torch_xla.device()
 autocast_ctx = torch.amp.autocast(device_type="xla", dtype=DTYPE)
 
 tokenizer = Tokenizer.from_directory()
@@ -689,7 +690,7 @@ while True:
         train_loss = loss.detach()
         loss = loss / grad_accum_steps
         loss.backward()
-        xm.mark_step()  # Prevent XLA from unconditionally unrolling all gradient accumulation steps
+        torch_xla.sync()  # Prevent XLA from unconditionally unrolling all gradient accumulation steps
         x, y, epoch = next(train_loader)
 
     # Progress and schedules
@@ -704,7 +705,7 @@ while True:
             group["weight_decay"] = muon_weight_decay
 
     xm.optimizer_step(optimizer)
-    xm.mark_step()
+    torch_xla.sync()
     model.zero_grad(set_to_none=True)
 
     if step % 10 == 0:
@@ -780,7 +781,7 @@ steady_state_mfu = (
     else 0
 )
 mem_info = xm.get_memory_info(device)
-peak_vram_mb = (mem_info["kb_total"] - mem_info["kb_free"]) / 1024
+peak_vram_mb = mem_info.get("peak_bytes_used", mem_info.get("bytes_used", 0)) / (1024 * 1024)
 
 print("---")
 print(f"val_bpb:          {val_bpb:.6f}")
