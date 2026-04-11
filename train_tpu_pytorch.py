@@ -6,11 +6,11 @@ Usage: uv run train_tpu_pytorch.py
 
 import os
 
-os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
 import gc
 import math
+import sys
 import time
 from dataclasses import asdict, dataclass
 
@@ -712,7 +712,7 @@ while True:
         # Fast fail: abort if loss is exploding or NaN
         if math.isnan(train_loss_f) or train_loss_f > 100:
             print("FAIL")
-            exit(1)
+            sys.exit(1)
 
         t1 = time.time()
         dt = (t1 - t0) / 10 if step > 0 else 0
