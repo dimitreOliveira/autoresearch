@@ -27,7 +27,7 @@ The experiments are designed to run on a Google Colab instance, which handles th
 **Setup Instructions:**
 
 1. Open `notebook_runner.ipynb` in Google Colab.
-2. Make sure you are using a GPU runtime (Runtime > Change runtime type > T4, L4, V100, or A100 GPU).
+2. Make sure you are using a GPU or TPU runtime (Runtime > Change runtime type > Hardware accelerator > GPU or TPU).
 3. Run the notebook. It will prompt you for your API keys (GitHub Personal Access Token and Gemini API Key).
 4. The notebook cells will then sequentially:
    - Clone the repository and install dependencies via `uv` (`prepare_notebook.py`).
@@ -50,7 +50,8 @@ The `program.md` file serves as essentially a super lightweight "skill" providin
 notebook_runner.ipynb — central orchestrator for Colab
 prepare_notebook.py   — sets up the Colab environment and Git PR workflow
 prepare.py            — constants, data prep + runtime utilities (do not modify)
-train_*.py              — model, optimizer, training loop (agent modifies this)
+train_gpu_pytorch.py  — model, optimizer, training loop for GPUs (agent modifies this)
+train_tpu_pytorch.py  — model, optimizer, training loop for TPUs (agent modifies this)
 program.md            — agent instructions
 pyproject.toml        — dependencies
 ```
@@ -60,6 +61,17 @@ pyproject.toml        — dependencies
 - **Single file to modify.** The agent only touches `train_*.py`. This keeps the scope manageable and diffs reviewable.
 - **Fixed time budget.** Training always runs for exactly 5 minutes, regardless of your specific platform. This means you can expect approx 12 experiments/hour and approx 100 experiments while you sleep. There are two upsides of this design decision. First, this makes experiments directly comparable regardless of what the agent changes (model size, batch size, architecture, etc). Second, this means that autoresearch will find the most optimal model for your platform in that time budget. The downside is that your runs (and results) become not comparable to other people running on other compute platforms.
 - **Self-contained.** No external dependencies beyond PyTorch and a few small packages. No distributed training, no complex configs. One GPU, one file, one metric.
+
+## TPU Support
+
+The repository also natively supports Google Colab TPUs (e.g. TPU v5e-1, v6e-1) through PyTorch XLA. The primary execution script for TPUs is `train_tpu_pytorch.py`, which introduces several key differences:
+
+- **PyTorch XLA:** Integrates standard PyTorch code utilizing XLA devices (`xm.xla_device()`) and compiles graphs matching TPU topology.
+- **Native bfloat16:** Because TPUs compute natively in `bfloat16`, which retains the dynamic range of `float32`, gradients no longer require a `GradScaler`.
+- **System Environment Integration:** `prepare_notebook.py` automatically detects TPU environments and installs dependencies into the system environment to preserve Colab's custom `torch_xla` installation without hiding it under `uv` isolated environments.
+- **Shared prep routines:** The `prepare.py` dataloader script processes dynamic device parameters, allowing the same dataset builder to interface identically onto GPUs and TPUs.
+
+> **Note for TPU execution:** When orchestrating through `notebook_runner.ipynb` on a TPU, configure it to target `TRAIN_FILE = "train_tpu_pytorch.py"`. You may also need to prefix shell commands with `UV_SYSTEM_PYTHON=1` to ensure `uv run` triggers using the system Python containing `torch_xla`.
 
 ## License
 

@@ -1,12 +1,11 @@
 """
-Autoresearch pretraining script. Single-GPU, single-file.
+Autoresearch pretraining script. Single-TPU, single-file.
 Cherry-picked and simplified from nanochat.
-Usage: uv run train_gpu_pytorch.py
+Usage: uv run train_tpu_pytorch.py
 """
 
 import os
 
-os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
 import gc
@@ -18,6 +17,8 @@ from dataclasses import asdict, dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch_xla
+import torch_xla.core.xla_model as xm
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, evaluate_bpb, make_dataloader
 
@@ -83,9 +84,10 @@ class CausalSelfAttention(nn.Module):
 
         # Value residual (ResFormer): mix in value embedding with input-dependent gate per head
         if ve is not None:
+            v_dtype = v.dtype
             ve = ve.view(B, T, self.n_kv_head, self.head_dim)
             gate = 2 * torch.sigmoid(self.ve_gate(x[..., : self.ve_gate_channels]))
-            v = v + gate.unsqueeze(-1) * ve
+            v = (v + gate.unsqueeze(-1) * ve).to(v_dtype)
 
         cos, sin = cos_sin
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
@@ -376,7 +378,7 @@ class GPT(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Optimizer (MuonAdamW, single GPU only)
+# Optimizer (MuonAdamW, single TPU only)
 # ---------------------------------------------------------------------------
 
 polar_express_coeffs = [
@@ -388,35 +390,30 @@ polar_express_coeffs = [
 ]
 
 
-@torch.compile(dynamic=False, fullgraph=True)
-def adamw_step_fused(
-    p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t
-):
-    p.mul_(1 - lr_t * wd_t)
-    exp_avg.lerp_(grad, 1 - beta1_t)
-    exp_avg_sq.lerp_(grad.square(), 1 - beta2_t)
-    bias1 = 1 - beta1_t**step_t
-    bias2 = 1 - beta2_t**step_t
-    denom = (exp_avg_sq / bias2).sqrt() + eps_t
-    step_size = lr_t / bias1
+def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step, lr, beta1, beta2, eps, wd):
+    p.mul_(1 - lr * wd)
+    exp_avg.lerp_(grad, 1 - beta1)
+    exp_avg_sq.lerp_(grad.square(), 1 - beta2)
+    bias1 = 1 - beta1**step
+    bias2 = 1 - beta2**step
+    denom = (exp_avg_sq / bias2).sqrt() + eps
+    step_size = lr / bias1
     p.add_(exp_avg / denom, alpha=-step_size)
 
 
-@torch.compile(dynamic=False, fullgraph=True)
 def muon_step_fused(
     stacked_grads,
     stacked_params,
     momentum_buffer,
     second_momentum_buffer,
-    momentum_t,
-    lr_t,
-    wd_t,
-    beta2_t,
+    momentum,
+    lr,
+    wd,
+    beta2,
     ns_steps,
     red_dim,
 ):
     # Nesterov momentum
-    momentum = momentum_t.to(stacked_grads.dtype)
     momentum_buffer.lerp_(stacked_grads, 1 - momentum)
     g = stacked_grads.lerp_(momentum_buffer, momentum)
     # Polar express orthogonalization
@@ -434,7 +431,6 @@ def muon_step_fused(
             X = a * X + B @ X
     g = X
     # NorMuon variance reduction
-    beta2 = beta2_t.to(g.dtype)
     v_mean = g.float().square().mean(dim=red_dim, keepdim=True)
     red_dim_size = g.size(red_dim)
     v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True) * red_dim_size
@@ -448,8 +444,6 @@ def muon_step_fused(
     final_scale = step_size * (v_norm / v_norm_new.clamp_min(1e-10))
     g = g * final_scale.to(g.dtype)
     # Cautious weight decay + parameter update
-    lr = lr_t.to(g.dtype)
-    wd = wd_t.to(g.dtype)
     mask = (g * stacked_params) >= 0
     stacked_params.sub_(lr * g + lr * wd * stacked_params * mask)
 
@@ -459,17 +453,6 @@ class MuonAdamW(torch.optim.Optimizer):
 
     def __init__(self, param_groups):
         super().__init__(param_groups, defaults={})
-        # 0-D CPU tensors to avoid torch.compile recompilation when values change
-        self._adamw_step_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_beta1_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_eps_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_momentum_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
 
     def _step_adamw(self, group):
         for p in group["params"]:
@@ -482,23 +465,17 @@ class MuonAdamW(torch.optim.Optimizer):
                 state["exp_avg"] = torch.zeros_like(p, dtype=torch.float32)
                 state["exp_avg_sq"] = torch.zeros_like(p, dtype=torch.float32)
             state["step"] += 1
-            self._adamw_step_t.fill_(state["step"])
-            self._adamw_lr_t.fill_(group["lr"])
-            self._adamw_beta1_t.fill_(group["betas"][0])
-            self._adamw_beta2_t.fill_(group["betas"][1])
-            self._adamw_eps_t.fill_(group["eps"])
-            self._adamw_wd_t.fill_(group["weight_decay"])
             adamw_step_fused(
                 p,
                 grad,
                 state["exp_avg"],
                 state["exp_avg_sq"],
-                self._adamw_step_t,
-                self._adamw_lr_t,
-                self._adamw_beta1_t,
-                self._adamw_beta2_t,
-                self._adamw_eps_t,
-                self._adamw_wd_t,
+                state["step"],
+                group["lr"],
+                group["betas"][0],
+                group["betas"][1],
+                group["eps"],
+                group["weight_decay"],
             )
 
     def _step_muon(self, group):
@@ -525,19 +502,16 @@ class MuonAdamW(torch.optim.Optimizer):
         red_dim = -1 if shape[-2] >= shape[-1] else -2
         stacked_grads = torch.stack([p.grad for p in params])
         stacked_params = torch.stack(params)
-        self._muon_momentum_t.fill_(group["momentum"])
-        self._muon_beta2_t.fill_(group["beta2"] if group["beta2"] is not None else 0.0)
-        self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1]) ** 0.5)
-        self._muon_wd_t.fill_(group["weight_decay"])
+        lr = group["lr"] * max(1.0, shape[-2] / shape[-1]) ** 0.5
         muon_step_fused(
             stacked_grads,
             stacked_params,
             state["momentum_buffer"],
             state["second_momentum_buffer"],
-            self._muon_momentum_t,
-            self._muon_lr_t,
-            self._muon_wd_t,
-            self._muon_beta2_t,
+            group["momentum"],
+            lr,
+            group["weight_decay"],
+            group["beta2"] if group["beta2"] is not None else 0.0,
             group["ns_steps"],
             red_dim,
         )
@@ -576,48 +550,34 @@ FINAL_LR_FRAC = 0.0  # final LR as fraction of initial
 # Model size
 SEQUENCE_LEN = 2048
 DEPTH = 8  # number of transformer layers
-DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
-EVAL_BATCH_SIZE = 128
+DEVICE_BATCH_SIZE = 16  # per-device batch size (reduce if OOM)
+EVAL_BATCH_SIZE = 16
 DTYPE = torch.bfloat16
 
-# GPU hardware detection and hyperparameter adjustments
-PEAK_FLOPS = 989.5e12  # Default to H100
-if torch.cuda.is_available():
-    gpu_name = torch.cuda.get_device_name()
-    cap = torch.cuda.get_device_capability()
-    print(f"Detected GPU: {gpu_name} (Compute Capability {cap[0]}.{cap[1]})")
+# TPU hardware detection and hyperparameter adjustments
+PEAK_FLOPS = 197.0e12  # Default to TPU v5e
 
-    if "H100" in gpu_name:
-        PEAK_FLOPS = 989.5e12
-    elif "A100" in gpu_name:
-        PEAK_FLOPS = 312.0e12
-    elif "L4" in gpu_name:
-        PEAK_FLOPS = 121.0e12
-    elif "V100" in gpu_name:
-        PEAK_FLOPS = 125.0e12
-    elif "T4" in gpu_name:
-        PEAK_FLOPS = 65.0e12
+try:
+    tpu_env = os.environ.get("TPU_NAME", "")
+    tpu_accel_type = os.environ.get("TPU_ACCELERATOR_TYPE", "")
+
+    if "v6e" in tpu_accel_type or "v6e" in tpu_env:
+        PEAK_FLOPS = 918.0e12
+        print("Detected TPU v6e (Trillium)")
+    elif "v5e" in tpu_accel_type or "v5e" in tpu_env:
+        PEAK_FLOPS = 197.0e12
+        print("Detected TPU v5e")
+    elif "v2" in tpu_accel_type or "v2" in tpu_env:
+        PEAK_FLOPS = 45.0e12
+        print("Detected TPU v2")
     else:
         print(
-            f"Warning: Unknown GPU '{gpu_name}', defaulting PEAK_FLOPS to H100. MFU metrics may be inaccurate."
+            f"Warning: Unknown TPU type '{tpu_accel_type}', defaulting to TPU v5e peak flops."
         )
+except Exception:
+    pass
 
-    if cap[0] < 8:
-        print(
-            "Compute Capability < 8 detected, switching to float16 (no native bfloat16)"
-        )
-        DTYPE = torch.float16
-
-    if "T4" in gpu_name or cap == (7, 5):
-        SEQUENCE_LEN = 512
-        DEPTH = 8
-        TOTAL_BATCH_SIZE = 65536
-        DEVICE_BATCH_SIZE = 128
-        EVAL_BATCH_SIZE = 64
-        WINDOW_PATTERN = "L"
-        print(
-            f"T4 detected, scaling down hyperparameters: seq_len={SEQUENCE_LEN}, depth={DEPTH}, batch_size={TOTAL_BATCH_SIZE}, window={WINDOW_PATTERN}"
-        )
+DTYPE = torch.bfloat16
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
@@ -625,11 +585,9 @@ if torch.cuda.is_available():
 
 t_start = time.time()
 torch.manual_seed(42)
-torch.cuda.manual_seed(42)
 torch.set_float32_matmul_precision("high")
-device = torch.device("cuda")
-autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=DTYPE)
-scaler = torch.amp.GradScaler("cuda", enabled=(DTYPE == torch.float16))
+device = torch_xla.device()
+autocast_ctx = torch.amp.autocast(device_type="xla", dtype=DTYPE)
 
 tokenizer = Tokenizer.from_directory()
 vocab_size = tokenizer.get_vocab_size()
@@ -654,10 +612,9 @@ def build_model_config(depth):
 config = build_model_config(DEPTH)
 print(f"Model config: {asdict(config)}")
 
-with torch.device("meta"):
-    model = GPT(config)
-model.to_empty(device=device)
+model = GPT(config)
 model.init_weights()
+model.to(device)
 
 param_counts = model.num_scaling_params()
 print("Parameter counts:")
@@ -680,9 +637,9 @@ optimizer = model.setup_optimizer(
     weight_decay=WEIGHT_DECAY,
 )
 
-model = torch.compile(model, dynamic=False)
-
-train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, SEQUENCE_LEN, "train")
+train_loader = make_dataloader(
+    tokenizer, DEVICE_BATCH_SIZE, SEQUENCE_LEN, "train", device="cpu"
+)
 x, y, epoch = next(train_loader)  # prefetch first batch
 
 print(f"Time budget: {TIME_BUDGET}s")
@@ -718,16 +675,20 @@ t_start_training = time.time()
 smooth_train_loss = 0
 total_training_time = 0
 step = 0
+t0 = time.time()
+dt = 0
 
 while True:
-    torch.cuda.synchronize()
-    t0 = time.time()
     for micro_step in range(grad_accum_steps):
+        # Move CPU tensors to XLA device
+        device_x = x.to(device, non_blocking=True)
+        device_y = y.to(device, non_blocking=True)
         with autocast_ctx:
-            loss = model(x, y)
+            loss = model(device_x, device_y)
         train_loss = loss.detach()
         loss = loss / grad_accum_steps
-        scaler.scale(loss).backward()
+        loss.backward()
+        torch_xla.sync()  # Prevent XLA from unconditionally unrolling all gradient accumulation steps
         x, y, epoch = next(train_loader)
 
     # Progress and schedules
@@ -741,38 +702,43 @@ while True:
             group["momentum"] = muon_momentum
             group["weight_decay"] = muon_weight_decay
 
-    scaler.step(optimizer)
-    scaler.update()
+    xm.optimizer_step(optimizer)
+    torch_xla.sync()
     model.zero_grad(set_to_none=True)
 
-    train_loss_f = train_loss.item()
+    if step % 10 == 0:
+        train_loss_f = train_loss.item()
 
-    # Fast fail: abort if loss is exploding or NaN
-    if math.isnan(train_loss_f) or train_loss_f > 100:
-        print("FAIL")
-        sys.exit(1)
+        # Fast fail: abort if loss is exploding or NaN
+        if math.isnan(train_loss_f) or train_loss_f > 100:
+            print("FAIL")
+            sys.exit(1)
 
-    torch.cuda.synchronize()
-    t1 = time.time()
-    dt = t1 - t0
+        t1 = time.time()
+        dt = (t1 - t0) / 10 if step > 0 else 0
+        t0 = t1
+
+        # Logging
+        ema_beta = 0.9
+        smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
+        debiased_smooth_loss = smooth_train_loss / (1 - ema_beta ** ((step // 10) + 1))
+        pct_done = 100 * progress
+        tok_per_sec = int(TOTAL_BATCH_SIZE / dt) if dt > 0 else 0
+        mfu = (
+            100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / PEAK_FLOPS
+            if dt > 0
+            else 0
+        )
+        remaining = max(0, TIME_BUDGET - total_training_time)
+
+        print(
+            f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ",
+            end="",
+            flush=True,
+        )
 
     if step > 10:
         total_training_time += dt
-
-    # Logging
-    ema_beta = 0.9
-    smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
-    debiased_smooth_loss = smooth_train_loss / (1 - ema_beta ** (step + 1))
-    pct_done = 100 * progress
-    tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
-    mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / PEAK_FLOPS
-    remaining = max(0, TIME_BUDGET - total_training_time)
-
-    print(
-        f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ",
-        end="",
-        flush=True,
-    )
 
     # GC management (Python's GC causes ~500ms stalls)
     if step == 0:
@@ -795,7 +761,9 @@ total_tokens = step * TOTAL_BATCH_SIZE
 # Final eval
 model.eval()
 with autocast_ctx:
-    val_bpb = evaluate_bpb(model, tokenizer, EVAL_BATCH_SIZE, seq_len=MAX_SEQ_LEN)
+    val_bpb = evaluate_bpb(
+        model, tokenizer, EVAL_BATCH_SIZE, seq_len=MAX_SEQ_LEN, device=device
+    )
 
 # Final summary
 t_end = time.time()
@@ -810,7 +778,10 @@ steady_state_mfu = (
     if total_training_time > 0
     else 0
 )
-peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
+mem_info = xm.get_memory_info(device)
+peak_vram_mb = mem_info.get("peak_bytes_used", mem_info.get("bytes_used", 0)) / (
+    1024 * 1024
+)
 
 print("---")
 print(f"val_bpb:          {val_bpb:.6f}")
