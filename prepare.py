@@ -321,11 +321,11 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000, device="cuda"):
         torch.cuda.is_available() and str(device) != "cpu" and "xla" not in str(device)
     )
     cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=pin_mem)
-    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device=device)
+    device_buffer = torch.empty(2 * B * T, dtype=torch.long, device=device)
     cpu_inputs = cpu_buffer[: B * T].view(B, T)
     cpu_targets = cpu_buffer[B * T :].view(B, T)
-    inputs = gpu_buffer[: B * T].view(B, T)
-    targets = gpu_buffer[B * T :].view(B, T)
+    inputs = device_buffer[: B * T].view(B, T)
+    targets = device_buffer[B * T :].view(B, T)
 
     while True:
         for row_idx in range(B):
@@ -364,7 +364,7 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000, device="cuda"):
 
         cpu_inputs.copy_(row_buffer[:, :-1])
         cpu_targets.copy_(row_buffer[:, 1:])
-        gpu_buffer.copy_(cpu_buffer, non_blocking=True)
+        device_buffer.copy_(cpu_buffer, non_blocking=True)
         yield inputs, targets, epoch
 
 
