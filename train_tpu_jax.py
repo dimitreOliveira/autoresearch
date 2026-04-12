@@ -3,26 +3,10 @@ Autoresearch pretraining script. Single-TPU, single-file. (JAX version)
 Usage: uv run train_tpu_jax.py
 """
 
-import os
-import sys
-
-sys.stdout.reconfigure(line_buffering=True)
-sys.stderr.reconfigure(line_buffering=True)
-
-os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
-os.environ["XLA_FLAGS"] = (
-    "--xla_gpu_triton_gemm_any=True "
-    "--xla_gpu_enable_latency_hiding_scheduler=true "
-    "--xla_gpu_enable_pipelined_all_reduce=true "
-    "--xla_gpu_enable_pipelined_all_gather=true "
-    "--xla_gpu_enable_pipelined_reduce_scatter=true "
-    "--xla_gpu_enable_while_loop_double_buffering=true "
-    "--xla_gpu_enable_pipelined_p2p=true "
-    "--xla_gpu_collective_permute_decomposer_threshold=1024 "
-)
-
+import functools
 import gc
 import math
+import os
 import sys
 import time
 from dataclasses import asdict, dataclass
@@ -40,7 +24,16 @@ from prepare import (
     make_dataloader,
 )
 
-jax.config.update("jax_default_matmul_precision", "tensorfloat32")
+# ---------------------------------------------------------------------------
+# Setup
+# ---------------------------------------------------------------------------
+
+sys.stdout.reconfigure(line_buffering=True)  # type: ignore
+sys.stderr.reconfigure(line_buffering=True)  # type: ignore
+
+os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+
+jax.config.update("jax_default_matmul_precision", "high")
 
 # ---------------------------------------------------------------------------
 # Hyperparameters
@@ -222,7 +215,11 @@ class CausalSelfAttention(nn.Module):
         attn_weights = jnp.einsum("bhqd,bhkd->bhqk", qt, kt) * scale
 
         causal_mask = jnp.tril(jnp.ones((T, T), dtype=jnp.bool_))
-        if self.window_size is not None and self.window_size >= 0 and self.window_size < T:
+        if (
+            self.window_size is not None
+            and self.window_size >= 0
+            and self.window_size < T
+        ):
             window_mask = jnp.triu(
                 jnp.ones((T, T), dtype=jnp.bool_), k=-(self.window_size - 1)
             )
@@ -270,9 +267,9 @@ class Block(nn.Module):
 
     @nn.compact
     def __call__(self, x, ve, cos_sin):
-        attn_out = CausalSelfAttention(self.config, self.layer_idx, self.window_size, name="attn")(
-            rms_norm(x), ve, cos_sin
-        )
+        attn_out = CausalSelfAttention(
+            self.config, self.layer_idx, self.window_size, name="attn"
+        )(rms_norm(x), ve, cos_sin)
         x = x + attn_out
         mlp_out = MLP(self.config, name="mlp")(rms_norm(x))
         x = x + mlp_out
@@ -324,7 +321,9 @@ class GPT(nn.Module):
             else:
                 ve = None
 
-            x = nn.remat(Block)(self.config, i, window_sizes[i], name=f"h_{i}")(x, ve, (cos, sin))
+            x = nn.remat(Block)(self.config, i, window_sizes[i], name=f"h_{i}")(
+                x, ve, (cos, sin)
+            )
 
         x = rms_norm(x)
 
@@ -591,9 +590,6 @@ def loss_fn(params, model, x, y):
     return loss, raw_loss
 
 
-import functools
-
-
 @functools.partial(jax.jit, static_argnames=("grad_accum_steps",))
 def train_step_accum(
     params,
@@ -665,7 +661,7 @@ def evaluate_bpb_jax(params, tokenizer, batch_size, seq_len=MAX_SEQ_LEN):
     token_bytes = get_token_bytes(device="cpu").numpy()
     val_loader = make_dataloader(tokenizer, batch_size, seq_len, "val", device="cpu")
     steps = EVAL_TOKENS // (batch_size * seq_len)
-    total_nats = 0.0
+    total_nats = jnp.array(0.0)
     total_bytes = 0
     for _ in range(steps):
         x, y, _ = next(val_loader)
@@ -673,14 +669,17 @@ def evaluate_bpb_jax(params, tokenizer, batch_size, seq_len=MAX_SEQ_LEN):
         y_jax = jnp.asarray(y.numpy())
 
         loss_flat = eval_step(params, x_jax, y_jax)
-        loss_flat_np = np.asarray(loss_flat).reshape(-1)  # loss is flat mask array
-        # wait cross_entropy_loss returns (-picked * mask) shape [B*T]
+
         y_flat = y.numpy().reshape(-1)
         nbytes = token_bytes[y_flat]
         mask = nbytes > 0
-        total_nats += (loss_flat_np * mask).sum()
-        total_bytes += nbytes.sum()
-    return total_nats / (math.log(2) * total_bytes)
+
+        # Accumulate on device to avoid synchronizing inside the loop
+        mask_jax = jax.device_put(mask)
+        total_nats += jnp.sum(loss_flat.reshape(-1) * mask_jax)
+        total_bytes += int(nbytes.sum())
+
+    return float(total_nats) / (math.log(2) * total_bytes)
 
 
 if __name__ == "__main__":

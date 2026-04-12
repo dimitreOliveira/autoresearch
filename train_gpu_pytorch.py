@@ -4,13 +4,9 @@ Cherry-picked and simplified from nanochat.
 Usage: uv run train_gpu_pytorch.py
 """
 
-import os
-
-os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
-os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
-
 import gc
 import math
+import os
 import sys
 import time
 from dataclasses import asdict, dataclass
@@ -20,6 +16,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, evaluate_bpb, make_dataloader
+
+# ---------------------------------------------------------------------------
+# Setup
+# ---------------------------------------------------------------------------
+
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
 # ---------------------------------------------------------------------------
 # GPT Model
