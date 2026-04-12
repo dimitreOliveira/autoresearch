@@ -585,11 +585,10 @@ def loss_fn(params, model, x, y):
     return loss, raw_loss
 
 
-@jax.jit
+@jax.jit(static_argnames=("grad_accum_steps",))
 def train_step_accum(
     params,
     state,
-    labels,
     x_batch,
     y_batch,
     lrm,
@@ -598,6 +597,8 @@ def train_step_accum(
     dmodel_lr_scale,
     grad_accum_steps,
 ):
+    labels = get_optimizer_labels(params)
+
     def body(carry, xy):
         p, st, lsum = carry
         x, y = xy
@@ -782,7 +783,6 @@ if __name__ == "__main__":
         params, opt_state, train_loss = train_step_accum(
             params,
             opt_state,
-            labels,
             x_jax,
             y_jax,
             jnp.array(lrm),
