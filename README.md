@@ -13,7 +13,7 @@ The repo is deliberately kept small and primarily revolves around these core fil
 - **`notebook_runner.ipynb`** — the central orchestrator notebook meant to be run in Colab. It automates the LLM API calls, handles the experiment execution loop, and manages creating automated Pull Requests.
 - **`prepare_notebook.py`** — a utility script used by the notebook to prepare the environment (clones the repo, installs dependencies via `uv`, and configures Git credentials).
 - **`prepare.py`** — fixed constants, one-time data prep (downloads training data, trains a BPE tokenizer), and runtime utilities (dataloader, evaluation). Not modified.
-- **`train_*.py`** — the single file the agent edits. Contains the full GPT model, optimizer (Muon + AdamW), and training loop. Everything is fair game: architecture, hyperparameters, optimizer, batch size, etc. **This file is edited and iterated on by the agent**.
+- **`train_*.py`** — the scripts the agent edits. Contains the full model, optimizer, and training loop. Everything is fair game: architecture, hyperparameters, optimizer, batch size, etc. Depending on your platform, there is `train_gpu_pytorch.py`, `train_tpu_pytorch.py`, and `train_tpu_jax.py`. **These files are edited and iterated on by the agent**.
 - **`program.md`** — baseline instructions for one agent. Point your agent here and let it go. **This file is edited and iterated on by the human**.
 
 By design, training runs for a **fixed 5-minute time budget** (wall clock, excluding startup/compilation), regardless of the details of your compute. The metric is **val_bpb** (validation bits per byte) — lower is better, and vocab-size-independent so architectural changes are fairly compared.
@@ -52,26 +52,49 @@ prepare_notebook.py   — sets up the Colab environment and Git PR workflow
 prepare.py            — constants, data prep + runtime utilities (do not modify)
 train_gpu_pytorch.py  — model, optimizer, training loop for GPUs (agent modifies this)
 train_tpu_pytorch.py  — model, optimizer, training loop for TPUs (agent modifies this)
+train_tpu_jax.py      — model, optimizer, training loop for TPUs using JAX/Flax (agent modifies this)
 program.md            — agent instructions
 pyproject.toml        — dependencies
 ```
 
 ## Design choices
 
-- **Single file to modify.** The agent only touches `train_*.py`. This keeps the scope manageable and diffs reviewable.
+- **Single file to modify.** The agent only touches the active `train_*.py`. This keeps the scope manageable and diffs reviewable.
 - **Fixed time budget.** Training always runs for exactly 5 minutes, regardless of your specific platform. This means you can expect approx 12 experiments/hour and approx 100 experiments while you sleep. There are two upsides of this design decision. First, this makes experiments directly comparable regardless of what the agent changes (model size, batch size, architecture, etc). Second, this means that autoresearch will find the most optimal model for your platform in that time budget. The downside is that your runs (and results) become not comparable to other people running on other compute platforms.
 - **Self-contained.** No external dependencies beyond PyTorch and a few small packages. No distributed training, no complex configs. One GPU, one file, one metric.
 
-## TPU Support
+
+## Colab PyTorch GPU Support
+
+The codebase specifically modifies the original `train.py` script into `train_gpu_pytorch.py` to robustly support the diversity of GPU allocations natively encountered on Google Colab (like T4, L4, V100, or A100 instances). The relevant changes include:
+
+- **Native SDPA instead of custom FA3 kernels:** Replaced the bespoke `flash-attn3` module dependencies with standard PyTorch `F.scaled_dot_product_attention()`. This ensures stable training via FlashAttention-2 functionality out-of-the-box without requiring complex kernel compilations that frequently break on diverse Colab runtimes.
+- **Dynamic Hardware Configurations:** Automatically checks `torch.cuda.get_device_capability()` and intelligently scales down hyperparameters (like `SEQUENCE_LEN`, `DEPTH`, `TOTAL_BATCH_SIZE`, and `WINDOW_PATTERN`) when assigned weaker instance types (such as the T4 commonly used in Colab's free tier).
+- **Automatic Mixed Precision (AMP):** Dynamically switches execution from `bfloat16` to `float16` if the assigned GPU architecture is older than Ampere (compute capability < 8). It also conditionally inserts a `torch.amp.GradScaler` into the backward pass to prevent gradient underflow and loss explosion for `float16` execution.
+- **Accurate MFU Calculation:** Replaced the hardcoded H100 `PEAK_FLOPS` constant with automatic adjustment logic based on `torch.cuda.get_device_name()`, ensuring Model Flop Utilization (MFU) metrics read correctly across all Colab GPU variants.
+
+## PyTorch TPU Support
 
 The repository also natively supports Google Colab TPUs (e.g. TPU v5e-1, v6e-1) through PyTorch XLA. The primary execution script for TPUs is `train_tpu_pytorch.py`, which introduces several key differences:
 
-- **PyTorch XLA:** Integrates standard PyTorch code utilizing XLA devices (`xm.xla_device()`) and compiles graphs matching TPU topology.
+- **PyTorch XLA:** Integrates standard PyTorch code utilizing XLA devices (`xm.xla_device()`). It relies on XLA's lazy tracing rather than `torch.compile` to prevent out-of-memory errors on device nodes.
 - **Native bfloat16:** Because TPUs compute natively in `bfloat16`, which retains the dynamic range of `float32`, gradients no longer require a `GradScaler`.
+- **Reduced Sync Logging:** To avoid pipeline stalls and maximize hardware utilization, XLA graph execution is kept asynchronous by only materializing scalar metrics (like `.item()`) every 10 steps.
 - **System Environment Integration:** `prepare_notebook.py` automatically detects TPU environments and installs dependencies into the system environment to preserve Colab's custom `torch_xla` installation without hiding it under `uv` isolated environments.
 - **Shared prep routines:** The `prepare.py` dataloader script processes dynamic device parameters, allowing the same dataset builder to interface identically onto GPUs and TPUs.
 
 > **Note for TPU execution:** When orchestrating through `notebook_runner.ipynb` on a TPU, configure it to target `TRAIN_FILE = "train_tpu_pytorch.py"`. You may also need to prefix shell commands with `UV_SYSTEM_PYTHON=1` to ensure `uv run` triggers using the system Python containing `torch_xla`.
+
+### JAX TPU Support
+
+In addition to PyTorch, `autoresearch` supports training on Google Colab TPUs using pure JAX and Flax via `train_tpu_jax.py`. Key differences from the PyTorch GPU script include:
+
+- **JAX/Flax Architecture:** The entire model incorporates `flax.linen` layers explicitly, while maintaining exactly numerical and structural parity with the PyTorch ResFormer baseline logic.
+- **Optax Optimizer Setups:** Replicates the custom PyTorch `MuonAdamW` Newton-Schulz logic via strictly stateless functional mappings deployed dynamically against categorical XLA PyTree architectures inside Optax wrappers. 
+- **JAX Lax Scan:** As opposed to stepping linearly out of a python loop iteratively, XLA natively runs grad accumulation loops embedded explicitly inside `jax.lax.scan()`. This fully insulates compilation bounds eliminating execution lags locally across devices.
+- **Dependency Isolation:** Designed natively independent! When using it inside Colab via UV environments, provision its exclusive requirements invoking `uv sync --extra colab_tpu_jax`. 
+
+> **Running the JAX TPU baseline:** To execute the script efficiently via `notebook_runner.ipynb` on Colab, pass the Environment variable `USE_JAX="1"` inside a cell block prior to initialization.
 
 ## License
 
