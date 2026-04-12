@@ -4,6 +4,10 @@ Usage: uv run train_tpu_jax.py
 """
 
 import os
+import sys
+
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
 
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 os.environ["XLA_FLAGS"] = (
@@ -159,9 +163,10 @@ def apply_rotary_emb(x, cos, sin):
 class CausalSelfAttention(nn.Module):
     config: GPTConfig
     layer_idx: int
+    window_size: int
 
     @nn.compact
-    def __call__(self, x, ve_in, cos_sin, window_size):
+    def __call__(self, x, ve_in, cos_sin):
         B, T, C = x.shape
         head_dim = self.config.n_embd // self.config.n_head
 
@@ -217,9 +222,9 @@ class CausalSelfAttention(nn.Module):
         attn_weights = jnp.einsum("bhqd,bhkd->bhqk", qt, kt) * scale
 
         causal_mask = jnp.tril(jnp.ones((T, T), dtype=jnp.bool_))
-        if window_size is not None and window_size >= 0 and window_size < T:
+        if self.window_size is not None and self.window_size >= 0 and self.window_size < T:
             window_mask = jnp.triu(
-                jnp.ones((T, T), dtype=jnp.bool_), k=-(window_size - 1)
+                jnp.ones((T, T), dtype=jnp.bool_), k=-(self.window_size - 1)
             )
             mask = causal_mask & window_mask
         else:
@@ -261,11 +266,12 @@ class MLP(nn.Module):
 class Block(nn.Module):
     config: GPTConfig
     layer_idx: int
+    window_size: int
 
     @nn.compact
-    def __call__(self, x, ve, cos_sin, window_size):
-        attn_out = CausalSelfAttention(self.config, self.layer_idx, name="attn")(
-            rms_norm(x), ve, cos_sin, window_size
+    def __call__(self, x, ve, cos_sin):
+        attn_out = CausalSelfAttention(self.config, self.layer_idx, self.window_size, name="attn")(
+            rms_norm(x), ve, cos_sin
         )
         x = x + attn_out
         mlp_out = MLP(self.config, name="mlp")(rms_norm(x))
@@ -318,7 +324,7 @@ class GPT(nn.Module):
             else:
                 ve = None
 
-            x = Block(self.config, i, name=f"h_{i}")(x, ve, (cos, sin), window_sizes[i])
+            x = nn.remat(Block)(self.config, i, window_sizes[i], name=f"h_{i}")(x, ve, (cos, sin))
 
         x = rms_norm(x)
 
@@ -585,7 +591,10 @@ def loss_fn(params, model, x, y):
     return loss, raw_loss
 
 
-@jax.jit(static_argnames=("grad_accum_steps",))
+import functools
+
+
+@functools.partial(jax.jit, static_argnames=("grad_accum_steps",))
 def train_step_accum(
     params,
     state,
@@ -633,6 +642,7 @@ def train_step_accum(
         (zero_grads, jnp.array(0.0)),
         (x_batch, y_batch),
         length=grad_accum_steps,
+        unroll=1,
     )
 
     # Apply one single step!
@@ -840,7 +850,6 @@ if __name__ == "__main__":
         if step > 10 and total_training_time >= TIME_BUDGET:
             break
 
-    print()
     total_tokens = step * TOTAL_BATCH_SIZE
 
     # Final eval
