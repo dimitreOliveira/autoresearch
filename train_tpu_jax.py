@@ -429,11 +429,16 @@ def muon_adamw_step(
         state["muon_second_momentum_buffer"],
     )
 
-    new_params = jax.tree_util.tree_map(lambda x: x[0], out_tree)
-    new_adam_m = jax.tree_util.tree_map(lambda x: x[1], out_tree)
-    new_adam_v = jax.tree_util.tree_map(lambda x: x[2], out_tree)
-    new_muon_m = jax.tree_util.tree_map(lambda x: x[3], out_tree)
-    new_muon_v2 = jax.tree_util.tree_map(lambda x: x[4], out_tree)
+    def get_tuple_idx(idx):
+        return jax.tree_util.tree_map(
+            lambda x: x[idx], out_tree, is_leaf=lambda x: isinstance(x, tuple)
+        )
+
+    new_params = get_tuple_idx(0)
+    new_adam_m = get_tuple_idx(1)
+    new_adam_v = get_tuple_idx(2)
+    new_muon_m = get_tuple_idx(3)
+    new_muon_v2 = get_tuple_idx(4)
 
     new_state = {
         "step": step,
