@@ -44,7 +44,7 @@ HEAD_DIM = 128
 WINDOW_PATTERN = "SSSL"
 
 TOTAL_BATCH_SIZE = 2**18
-BASE_LR = 0.006
+BASE_LR = 0.008
 WEIGHT_DECAY = 0.05
 ADAM_BETAS = (0.9, 0.95)
 WARMUP_RATIO = 0.1
@@ -92,10 +92,6 @@ class GPTConfig:
     n_kv_head: int = 6
     n_embd: int = 768
     window_pattern: str = "SSSL"
-
-
-def has_ve(layer_idx, n_layer):
-    return layer_idx % 2 == (n_layer - 1) % 2
 
 
 def compute_window_sizes(config):
@@ -156,7 +152,7 @@ class CausalSelfAttention(nn.Module):
     window_size: int
 
     @nn.compact
-    def __call__(self, x, ve_in, cos_sin):
+    def __call__(self, x, cos_sin):
         B, T, C = x.shape
         head_dim = self.config.n_embd // self.config.n_head
 
@@ -182,20 +178,6 @@ class CausalSelfAttention(nn.Module):
         q = q.reshape((B, T, self.config.n_head, head_dim))
         k = k.reshape((B, T, self.config.n_kv_head, head_dim))
         v = v.reshape((B, T, self.config.n_kv_head, head_dim))
-
-        if ve_in is not None:
-            v_dtype = v.dtype
-            ve = ve_in.reshape((B, T, self.config.n_kv_head, head_dim))
-            ve_gate_channels = 32
-            x_ve = x[..., :ve_gate_channels]
-            ve_gate = nn.Dense(
-                self.config.n_kv_head,
-                use_bias=False,
-                kernel_init=nn.initializers.zeros,
-                name="ve_gate",
-            )(x_ve)
-            gate = 2.0 * nn.sigmoid(ve_gate)
-            v = (v + gate[..., None] * ve).astype(v_dtype)
 
         cos, sin = cos_sin
         q = apply_rotary_emb(q, cos, sin)
@@ -263,10 +245,10 @@ class Block(nn.Module):
     window_size: int
 
     @nn.compact
-    def __call__(self, x, ve, cos_sin):
+    def __call__(self, x, cos_sin):
         attn_out = CausalSelfAttention(
             self.config, self.layer_idx, self.window_size, name="attn"
-        )(rms_norm(x), ve, cos_sin)
+        )(rms_norm(x), cos_sin)
         x = x + attn_out
         mlp_out = MLP(self.config, name="mlp")(rms_norm(x))
         x = x + mlp_out
@@ -293,33 +275,9 @@ class GPT(nn.Module):
         # precompute only up to T
         cos, sin = precompute_rotary_embeddings(T, head_dim)
 
-        x = rms_norm(x)
-        x0 = x
-
-        resid_lambdas = self.param(
-            "resid_lambdas", nn.initializers.ones, (self.config.n_layer,), jnp.float32
-        )
-        x0_lambdas = self.param(
-            "x0_lambdas",
-            nn.initializers.constant(0.1),
-            (self.config.n_layer,),
-            jnp.float32,
-        )
-
         for i in range(self.config.n_layer):
-            x = resid_lambdas[i] * x + x0_lambdas[i] * x0
-            if has_ve(i, self.config.n_layer):
-                ve = nn.Embed(
-                    self.config.vocab_size,
-                    self.config.n_kv_head * head_dim,
-                    embedding_init=init_linear,
-                    name=f"value_embeds_{i}",
-                )(idx)
-            else:
-                ve = None
-
             x = nn.remat(Block)(self.config, i, window_sizes[i], name=f"h_{i}")(
-                x, ve, (cos, sin)
+                x, (cos, sin)
             )
 
         x = rms_norm(x)
