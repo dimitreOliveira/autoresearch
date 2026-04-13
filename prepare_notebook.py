@@ -15,7 +15,7 @@ def main(repo_dir, train_file):
     # Determine the absolute repository directory
     current_repo_dir = os.path.abspath(repo_dir)
 
-    train_file_base = train_file.replace(".py", "")
+    train_file_base = os.path.splitext(os.path.basename(train_file))[0]
 
     if train_file_base == "train_tpu_jax":
         print(
