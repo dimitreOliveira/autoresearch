@@ -323,25 +323,22 @@ def init_adamw_state(params):
 def adamw_step(params, grads, state, lr, wd, beta1=0.9, beta2=0.95, eps=1e-8):
     step = state["step"] + 1
     
-    def get_p(p, g, m, v):
-        is_2d = p.ndim >= 2
-        actual_wd = wd if is_2d else 0.0
-        p = p * (1.0 - lr * actual_wd)
+    def update_fn(p, g, m, v):
         m_new = beta1 * m + (1 - beta1) * g
         v_new = beta2 * v + (1 - beta2) * jnp.square(g)
         m_hat = m_new / (1 - beta1 ** step)
         v_hat = v_new / (1 - beta2 ** step)
-        return p - lr * m_hat / (jnp.sqrt(v_hat) + eps)
+        is_2d = p.ndim >= 2
+        actual_wd = wd if is_2d else 0.0
+        p_new = p * (1.0 - lr * actual_wd) - lr * m_hat / (jnp.sqrt(v_hat) + eps)
+        return p_new, m_new, v_new
 
-    def get_m(p, g, m, v):
-        return beta1 * m + (1 - beta1) * g
-
-    def get_v(p, g, m, v):
-        return beta2 * v + (1 - beta2) * jnp.square(g)
-
-    new_params = jax.tree_util.tree_map(get_p, params, grads, state["exp_avg"], state["exp_avg_sq"])
-    new_m = jax.tree_util.tree_map(get_m, params, grads, state["exp_avg"], state["exp_avg_sq"])
-    new_v = jax.tree_util.tree_map(get_v, params, grads, state["exp_avg"], state["exp_avg_sq"])
+    out_tree = jax.tree_util.tree_map(update_fn, params, grads, state["exp_avg"], state["exp_avg_sq"])
+    new_params, new_m, new_v = jax.tree_util.tree_transpose(
+        jax.tree_util.tree_structure(params),
+        jax.tree_util.tree_structure((0, 0, 0)),
+        out_tree
+    )
     
     new_state = {
         "step": step,
