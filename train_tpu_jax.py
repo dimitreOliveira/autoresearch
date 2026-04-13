@@ -43,16 +43,13 @@ ASPECT_RATIO = 64
 HEAD_DIM = 128
 WINDOW_PATTERN = "SSSL"
 
-TOTAL_BATCH_SIZE = 2**19
-EMBEDDING_LR = 0.6
-UNEMBEDDING_LR = 0.004
-MATRIX_LR = 0.04
-SCALAR_LR = 0.5
-WEIGHT_DECAY = 0.2
-ADAM_BETAS = (0.8, 0.95)
+TOTAL_BATCH_SIZE = 2**18
+BASE_LR = 0.008
+WEIGHT_DECAY = 0.05
+ADAM_BETAS = (0.9, 0.95)
 WARMUP_RATIO = 0.1
 WARMDOWN_RATIO = 0.5
-FINAL_LR_FRAC = 0.0
+FINAL_LR_FRAC = 0.1
 
 SEQUENCE_LEN = 2048
 DEPTH = 8
@@ -95,10 +92,6 @@ class GPTConfig:
     n_kv_head: int = 6
     n_embd: int = 768
     window_pattern: str = "SSSL"
-
-
-def has_ve(layer_idx, n_layer):
-    return layer_idx % 2 == (n_layer - 1) % 2
 
 
 def compute_window_sizes(config):
@@ -159,7 +152,7 @@ class CausalSelfAttention(nn.Module):
     window_size: int
 
     @nn.compact
-    def __call__(self, x, ve_in, cos_sin):
+    def __call__(self, x, cos_sin):
         B, T, C = x.shape
         head_dim = self.config.n_embd // self.config.n_head
 
@@ -185,20 +178,6 @@ class CausalSelfAttention(nn.Module):
         q = q.reshape((B, T, self.config.n_head, head_dim))
         k = k.reshape((B, T, self.config.n_kv_head, head_dim))
         v = v.reshape((B, T, self.config.n_kv_head, head_dim))
-
-        if ve_in is not None:
-            v_dtype = v.dtype
-            ve = ve_in.reshape((B, T, self.config.n_kv_head, head_dim))
-            ve_gate_channels = 32
-            x_ve = x[..., :ve_gate_channels]
-            ve_gate = nn.Dense(
-                self.config.n_kv_head,
-                use_bias=False,
-                kernel_init=nn.initializers.zeros,
-                name="ve_gate",
-            )(x_ve)
-            gate = 2.0 * nn.sigmoid(ve_gate)
-            v = (v + gate[..., None] * ve).astype(v_dtype)
 
         cos, sin = cos_sin
         q = apply_rotary_emb(q, cos, sin)
@@ -266,10 +245,10 @@ class Block(nn.Module):
     window_size: int
 
     @nn.compact
-    def __call__(self, x, ve, cos_sin):
+    def __call__(self, x, cos_sin):
         attn_out = CausalSelfAttention(
             self.config, self.layer_idx, self.window_size, name="attn"
-        )(rms_norm(x), ve, cos_sin)
+        )(rms_norm(x), cos_sin)
         x = x + attn_out
         mlp_out = MLP(self.config, name="mlp")(rms_norm(x))
         x = x + mlp_out
@@ -296,33 +275,9 @@ class GPT(nn.Module):
         # precompute only up to T
         cos, sin = precompute_rotary_embeddings(T, head_dim)
 
-        x = rms_norm(x)
-        x0 = x
-
-        resid_lambdas = self.param(
-            "resid_lambdas", nn.initializers.ones, (self.config.n_layer,), jnp.float32
-        )
-        x0_lambdas = self.param(
-            "x0_lambdas",
-            nn.initializers.constant(0.1),
-            (self.config.n_layer,),
-            jnp.float32,
-        )
-
         for i in range(self.config.n_layer):
-            x = resid_lambdas[i] * x + x0_lambdas[i] * x0
-            if has_ve(i, self.config.n_layer):
-                ve = nn.Embed(
-                    self.config.vocab_size,
-                    self.config.n_kv_head * head_dim,
-                    embedding_init=init_linear,
-                    name=f"value_embeds_{i}",
-                )(idx)
-            else:
-                ve = None
-
             x = nn.remat(Block)(self.config, i, window_sizes[i], name=f"h_{i}")(
-                x, ve, (cos, sin)
+                x, (cos, sin)
             )
 
         x = rms_norm(x)
@@ -355,213 +310,41 @@ def estimate_flops(model_config, num_params, wte_params, lm_head_params):
 
 
 # ---------------------------------------------------------------------------
-# Custom Optimizer (Muon + AdamW)
+# Custom Optimizer (AdamW)
 # ---------------------------------------------------------------------------
 
-polar_express_coeffs = [
-    (8.156554524902461, -22.48329292557795, 15.878769915207462),
-    (4.042929935166739, -2.808917465908714, 0.5000178451051316),
-    (3.8916678022926607, -2.772484153217685, 0.5060648178503393),
-    (3.285753657755655, -2.3681294933425376, 0.46449024233003106),
-    (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
-]
+def init_adamw_state(params):
+    return {
+        "step": jnp.array(0, dtype=jnp.int32),
+        "exp_avg": jax.tree_util.tree_map(jnp.zeros_like, params),
+        "exp_avg_sq": jax.tree_util.tree_map(jnp.zeros_like, params),
+    }
 
+def adamw_step(params, grads, state, lr, wd, beta1=0.9, beta2=0.95, eps=1e-8):
+    step = state["step"] + 1
+    
+    def update_fn(p, g, m, v):
+        m_new = beta1 * m + (1 - beta1) * g
+        v_new = beta2 * v + (1 - beta2) * jnp.square(g)
+        m_hat = m_new / (1 - beta1 ** step)
+        v_hat = v_new / (1 - beta2 ** step)
+        is_2d = p.ndim >= 2
+        actual_wd = wd if is_2d else 0.0
+        p_new = p * (1.0 - lr * actual_wd) - lr * m_hat / (jnp.sqrt(v_hat) + eps)
+        return p_new, m_new, v_new
 
-def zeropower_via_newtonschulz5(g, steps=5):
-    X = g.astype(jnp.float32)
-    is_wide = X.shape[-2] > X.shape[-1]
-    if is_wide:
-        X = X.swapaxes(-2, -1)
-
-    X = X / (jnp.linalg.norm(X, axis=(-2, -1), keepdims=True) * 1.02 + 1e-6)
-
-    for a, b, c in polar_express_coeffs[:steps]:
-        A = X @ X.swapaxes(-2, -1)
-        B = b * A + c * (A @ A)
-        X = a * X + B @ X
-
-    if is_wide:
-        X = X.swapaxes(-2, -1)
-    return X
-
-
-def get_optimizer_labels(params):
-    def label_fn(path, value):
-        path_str = "/".join(str(p.key) if hasattr(p, "key") else str(p) for p in path)
-        if "wte" in path_str:
-            return "embedding"
-        elif "lm_head" in path_str:
-            return "unembedding"
-        elif "resid_lambdas" in path_str or "x0_lambdas" in path_str:
-            return "scalar"
-        elif "value_embeds" in path_str:
-            return "embedding"
-        elif hasattr(value, "ndim") and value.ndim == 2:
-            return "muon"
-        else:
-            return "other"
-
-    return jax.tree_util.tree_map_with_path(label_fn, params)
-
-
-def init_custom_optimizer(params, labels):
-    def _init(label, p):
-        if label in ["embedding", "unembedding", "scalar", "other"]:
-            return {
-                "step": jnp.array(0, dtype=jnp.int32),
-                "exp_avg": jnp.zeros_like(p, dtype=jnp.float32),
-                "exp_avg_sq": jnp.zeros_like(p, dtype=jnp.float32),
-            }
-        elif label == "muon":
-            shape = p.shape
-            state_shape = (shape[-2], 1) if shape[-2] >= shape[-1] else (1, shape[-1])
-            return {
-                "momentum_buffer": jnp.zeros_like(p, dtype=p.dtype),
-                "second_momentum_buffer": jnp.zeros(state_shape, dtype=p.dtype),
-            }
-        else:
-            raise ValueError(f"Unknown label {label}")
-
-    return jax.tree_util.tree_map(
-        _init, labels, params, is_leaf=lambda x: isinstance(x, jax.Array)
+    out_tree = jax.tree_util.tree_map(update_fn, params, grads, state["exp_avg"], state["exp_avg_sq"])
+    new_params, new_m, new_v = jax.tree_util.tree_transpose(
+        jax.tree_util.tree_structure(params),
+        jax.tree_util.tree_structure((0, 0, 0)),
+        out_tree
     )
-
-
-def step_custom_optimizer(
-    params,
-    grads,
-    state,
-    labels,
-    lrm,
-    muon_momentum,
-    muon_weight_decay,
-    dmodel_lr_scale,
-    adam_betas=(0.8, 0.95),
-):
-    def _step(label, p, g, st):
-        if label == "unembedding":
-            lr = UNEMBEDDING_LR * dmodel_lr_scale * lrm
-            wd = 0.0
-            return _adamw_step(p, g, st, lr, adam_betas[0], adam_betas[1], 1e-10, wd)
-        elif label == "embedding":
-            lr = EMBEDDING_LR * dmodel_lr_scale * lrm
-            wd = 0.0
-            return _adamw_step(p, g, st, lr, adam_betas[0], adam_betas[1], 1e-10, wd)
-        elif label == "scalar":
-            lr = SCALAR_LR * lrm
-            # For scalars, PyTorch configures it to adapt between 0.01 and 1 per path
-            # To strictly match: resid_lambdas has lr=scalar_lr * 0.01, x0_lambdas gets scalar_lr
-            # In Jax we can differentiate using shape, but we assign SCALAR_LR here and modify below if needed
-            wd = 0.0
-            # Wait, x0_lambdas had betad (0.96, 0.95), we align to PyTorch if possible or just use (0.8, 0.95)
-            # For brevity, use standard adam_betas
-            return _adamw_step(
-                p, g, st, lr * 0.01, adam_betas[0], adam_betas[1], 1e-10, wd
-            )
-        elif label == "muon":
-            lr = MATRIX_LR * lrm
-            return _muon_step(
-                p, g, st, lr, muon_momentum, adam_betas[1], muon_weight_decay
-            )
-        else:
-            return p, st
-
-    def _adamw_step(p, grad, state, lr, beta1, beta2, eps, wd):
-        p = p * (1 - lr * wd)
-        step = state["step"] + 1
-        exp_avg = state["exp_avg"] * beta1 + grad * (1 - beta1)
-        exp_avg_sq = state["exp_avg_sq"] * beta2 + jnp.square(grad) * (1 - beta2)
-        bias1 = 1 - beta1**step
-        bias2 = 1 - beta2**step
-        denom = jnp.sqrt(exp_avg_sq / bias2) + eps
-        step_size = lr / bias1
-        p = p - step_size * (exp_avg / denom)
-        new_state = {"step": step, "exp_avg": exp_avg, "exp_avg_sq": exp_avg_sq}
-        return p, new_state
-
-    def _muon_step(p, grad, state, lr, momentum, beta2, wd):
-        shape = p.shape
-        red_dim = -1 if shape[-2] >= shape[-1] else -2
-
-        momentum_buffer = state["momentum_buffer"]
-        second_momentum_buffer = state["second_momentum_buffer"]
-
-        momentum_buffer = jnp.where(
-            True, momentum_buffer * momentum + grad * (1 - momentum), momentum_buffer
-        )
-        g = momentum_buffer * momentum + grad * (1 - momentum)
-
-        g_orth = zeropower_via_newtonschulz5(g, steps=5)
-        g_orth = g_orth.astype(jnp.float32)
-
-        v_mean = jnp.mean(jnp.square(g_orth), axis=red_dim, keepdims=True)
-        red_dim_size = g_orth.shape[red_dim]
-        v_norm_sq = jnp.sum(v_mean, axis=(-2, -1), keepdims=True) * red_dim_size
-        v_norm = jnp.sqrt(v_norm_sq)
-
-        second_momentum_buffer = second_momentum_buffer * beta2 + v_mean.astype(
-            second_momentum_buffer.dtype
-        ) * (1 - beta2)
-        step_size = jax.lax.rsqrt(jnp.maximum(second_momentum_buffer, 1e-10))
-        scaled_sq_sum = (v_mean * red_dim_size) * jnp.square(
-            step_size.astype(jnp.float32)
-        )
-        v_norm_new = jnp.sqrt(jnp.sum(scaled_sq_sum, axis=(-2, -1), keepdims=True))
-
-        final_scale = step_size * (v_norm / jnp.maximum(v_norm_new, 1e-10))
-        g_final = g_orth * final_scale.astype(g_orth.dtype)
-
-        mask = (g_final * p) >= 0
-        lr_scaled = lr * max(1.0, shape[-2] / shape[-1]) ** 0.5
-        p = p - (lr_scaled * g_final + lr_scaled * wd * p * mask)
-
-        new_state = {
-            "momentum_buffer": momentum_buffer,
-            "second_momentum_buffer": second_momentum_buffer,
-        }
-        return p, new_state
-
-    # Workaround varying learning rates within `scalar` label
-    # resid_lambdas vs x0_lambdas matching PyTorch logic
-    def _apply_step(path, label, p, g, st):
-        path_str = "/".join(str(i.key) if hasattr(i, "key") else str(i) for i in path)
-        new_p, new_st = _step(label, p, g, st)
-        if "x0_lambdas" in path_str:  # x0 uses scalar_lr, beta=(0.96, 0.95)
-            lr = SCALAR_LR * lrm
-            return _adamw_step(p, g, st, lr, 0.96, 0.95, 1e-10, 0.0)
-        return new_p, new_st
-
-    flat_labels, tree_def = jax.tree_util.tree_flatten(
-        labels, is_leaf=lambda x: isinstance(x, str)
-    )
-    flat_p, _ = jax.tree_util.tree_flatten(params)
-    flat_g, _ = jax.tree_util.tree_flatten(grads)
-    # custom flatten for state which is dict per param
-    flat_st, _ = jax.tree_util.tree_flatten(
-        state,
-        is_leaf=lambda x: (
-            isinstance(x, dict) and ("momentum_buffer" in x or "exp_avg" in x)
-        ),
-    )
-
-    # We must use tree_map_with_path to inspect x0_lambdas vs resid_lambdas
-    out = jax.tree_util.tree_map_with_path(
-        _apply_step,
-        labels,
-        params,
-        grads,
-        state,
-        is_leaf=lambda x: isinstance(x, jax.Array),
-    )
-
-    # Separate the tuple tree back into (params, state)
-    new_params = jax.tree_util.tree_map(
-        lambda x: x[0], out, is_leaf=lambda x: isinstance(x, tuple) and len(x) == 2
-    )
-    new_state = jax.tree_util.tree_map(
-        lambda x: x[1], out, is_leaf=lambda x: isinstance(x, tuple) and len(x) == 2
-    )
-
+    
+    new_state = {
+        "step": step,
+        "exp_avg": new_m,
+        "exp_avg_sq": new_v,
+    }
     return new_params, new_state
 
 
@@ -596,32 +379,12 @@ def train_step_accum(
     state,
     x_batch,
     y_batch,
-    lrm,
-    muon_momentum,
-    muon_wd,
-    dmodel_lr_scale,
+    lr,
+    wd,
     grad_accum_steps,
 ):
-    labels = get_optimizer_labels(params)
-
-    def body(carry, xy):
-        p, st, lsum = carry
-        x, y = xy
-        (loss, raw_loss), grads = jax.value_and_grad(loss_fn, has_aux=True)(
-            p, model, x, y
-        )
-        grads = jax.tree_util.tree_map(lambda g: g / grad_accum_steps, grads)
-
-        # Accumulate gradients (since we can't easily wait to step, we just step repeatedly with scaled grads)
-        # Note: PyTorch loops grad accumulation and applies step ONCE.
-        # In JAX, we can either accumulate grads or step with them directly if scale handles it.
-        # But Muon is highly non-linear, we MUST ACCUMULATE GRADS fully before taking a step!
-        return (p, st, lsum + loss), grads
-
-    # Initialize zero grads
     zero_grads = jax.tree_util.tree_map(jnp.zeros_like, params)
 
-    # We scan to accumulate gradients
     def accum_body(carry, xy):
         acc_grads, lsum = carry
         x, y = xy
@@ -641,9 +404,8 @@ def train_step_accum(
         unroll=1,
     )
 
-    # Apply one single step!
-    new_params, new_state = step_custom_optimizer(
-        params, final_grads, state, labels, lrm, muon_momentum, muon_wd, dmodel_lr_scale
+    new_params, new_state = adamw_step(
+        params, final_grads, state, lr, wd, beta1=ADAM_BETAS[0], beta2=ADAM_BETAS[1]
     )
 
     return new_params, new_state, total_loss / grad_accum_steps
@@ -713,8 +475,7 @@ if __name__ == "__main__":
     variables = model.init(rng, dummy_idx)
     params = variables["params"]
 
-    labels = get_optimizer_labels(params)
-    opt_state = init_custom_optimizer(params, labels)
+    opt_state = init_adamw_state(params)
 
     # param counts
     def count_params(tree):
@@ -750,15 +511,8 @@ if __name__ == "__main__":
             cooldown = (1.0 - progress) / WARMDOWN_RATIO
             return cooldown * 1.0 + (1 - cooldown) * FINAL_LR_FRAC
 
-    def get_muon_momentum(step):
-        frac = min(step / 300, 1.0)
-        return (1 - frac) * 0.85 + frac * 0.95
-
     def get_weight_decay(progress):
         return WEIGHT_DECAY * (1 - progress)
-
-    dmodel_lr_scale = (config.n_embd / 768.0) ** -0.5
-    print(f"Scaling AdamW LRs by 1/sqrt(dim/768) = {dmodel_lr_scale:.6f}")
 
     t_start_training = time.time()
     smooth_train_loss = 0
@@ -786,18 +540,16 @@ if __name__ == "__main__":
 
         progress = min(total_training_time / TIME_BUDGET, 1.0)
         lrm = get_lr_multiplier(progress)
-        muon_momentum = get_muon_momentum(step)
-        muon_weight_decay = get_weight_decay(progress)
+        lr = BASE_LR * lrm
+        wd = get_weight_decay(progress)
 
         params, opt_state, train_loss = train_step_accum(
             params,
             opt_state,
             x_jax,
             y_jax,
-            jnp.array(lrm),
-            jnp.array(muon_momentum),
-            jnp.array(muon_weight_decay),
-            jnp.array(dmodel_lr_scale),
+            jnp.array(lr),
+            jnp.array(wd),
             grad_accum_steps,
         )
 
@@ -829,7 +581,7 @@ if __name__ == "__main__":
         remaining = max(0, TIME_BUDGET - total_training_time)
 
         print(
-            f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ",
+            f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lr: {lr:.4f} | dt: {dt * 1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ",
             end="",
             flush=True,
         )
