@@ -43,13 +43,15 @@ ASPECT_RATIO = 64
 HEAD_DIM = 128
 WINDOW_PATTERN = "SSSL"
 
-TOTAL_BATCH_SIZE = 2**18
-BASE_LR = 0.008
-WEIGHT_DECAY = 0.05
-ADAM_BETAS = (0.9, 0.95)
+TOTAL_BATCH_SIZE = 2**19
+EMBEDDING_LR = 0.6
+UNEMBEDDING_LR = 0.004
+MATRIX_LR = 0.04
+WEIGHT_DECAY = 0.2
+ADAM_BETAS = (0.8, 0.95)
 WARMUP_RATIO = 0.1
 WARMDOWN_RATIO = 0.5
-FINAL_LR_FRAC = 0.1
+FINAL_LR_FRAC = 0.0
 
 SEQUENCE_LEN = 2048
 DEPTH = 8
@@ -310,40 +312,135 @@ def estimate_flops(model_config, num_params, wte_params, lm_head_params):
 
 
 # ---------------------------------------------------------------------------
-# Custom Optimizer (AdamW)
+# Custom Optimizer (MuonAdamW)
 # ---------------------------------------------------------------------------
 
-def init_adamw_state(params):
+polar_express_coeffs = [
+    (8.156554524902461, -22.48329292557795, 15.878769915207462),
+    (4.042929935166739, -2.808917465908714, 0.5000178451051316),
+    (3.8916678022926607, -2.772484153217685, 0.5060648178503393),
+    (3.285753657755655, -2.3681294933425376, 0.46449024233003106),
+    (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
+]
+
+
+def init_optimizer_state(params):
+    adamw_exp_avg = jax.tree_util.tree_map(jnp.zeros_like, params)
+    adamw_exp_avg_sq = jax.tree_util.tree_map(jnp.zeros_like, params)
+    muon_momentum_buffer = jax.tree_util.tree_map(jnp.zeros_like, params)
+
+    def init_second_momentum(p):
+        if p.ndim >= 2:
+            shape = p.shape
+            state_shape = (1, shape[-1]) if shape[-1] >= shape[-2] else (shape[-2], 1)
+            return jnp.zeros(state_shape, dtype=p.dtype)
+        return jnp.zeros((1,), dtype=p.dtype)
+
+    muon_second_momentum_buffer = jax.tree_util.tree_map(init_second_momentum, params)
+
     return {
         "step": jnp.array(0, dtype=jnp.int32),
-        "exp_avg": jax.tree_util.tree_map(jnp.zeros_like, params),
-        "exp_avg_sq": jax.tree_util.tree_map(jnp.zeros_like, params),
+        "adamw_exp_avg": adamw_exp_avg,
+        "adamw_exp_avg_sq": adamw_exp_avg_sq,
+        "muon_momentum_buffer": muon_momentum_buffer,
+        "muon_second_momentum_buffer": muon_second_momentum_buffer,
     }
 
-def adamw_step(params, grads, state, lr, wd, beta1=0.9, beta2=0.95, eps=1e-8):
-    step = state["step"] + 1
-    
-    def update_fn(p, g, m, v):
-        m_new = beta1 * m + (1 - beta1) * g
-        v_new = beta2 * v + (1 - beta2) * jnp.square(g)
-        m_hat = m_new / (1 - beta1 ** step)
-        v_hat = v_new / (1 - beta2 ** step)
-        is_2d = p.ndim >= 2
-        actual_wd = wd if is_2d else 0.0
-        p_new = p * (1.0 - lr * actual_wd) - lr * m_hat / (jnp.sqrt(v_hat) + eps)
-        return p_new, m_new, v_new
 
-    out_tree = jax.tree_util.tree_map(update_fn, params, grads, state["exp_avg"], state["exp_avg_sq"])
-    new_params, new_m, new_v = jax.tree_util.tree_transpose(
-        jax.tree_util.tree_structure(params),
-        jax.tree_util.tree_structure((0, 0, 0)),
-        out_tree
+def muon_adamw_step(
+    params, grads, state, lrm, muon_momentum, wd, dmodel_lr_scale, ns_steps=5
+):
+    step = state["step"] + 1
+
+    def update_leaf(path, p, g, adam_m, adam_v, muon_m, muon_v2):
+        path_str = "".join([str(k.key) if hasattr(k, "key") else str(k) for k in path])
+        is_muon = "h_" in path_str and "kernel" in path_str
+
+        if is_muon:
+            momentum = muon_momentum
+            beta2 = 0.95
+
+            muon_m_new = muon_m * momentum + g * (1.0 - momentum)
+            g_nesterov = g * (1.0 - momentum) + muon_m_new * momentum
+
+            X = g_nesterov.astype(jnp.float32)
+            X = X / (jnp.linalg.norm(X, axis=(-2, -1), keepdims=True) * 1.02 + 1e-6)
+
+            if p.shape[-1] > p.shape[-2]:
+                for a, b, c in polar_express_coeffs[:ns_steps]:
+                    A = X @ X.T
+                    B = b * A + c * (A @ A)
+                    X = a * X + B @ X
+            else:
+                for a, b, c in polar_express_coeffs[:ns_steps]:
+                    A = X.T @ X
+                    B = b * A + c * (A @ A)
+                    X = a * X + X @ B
+
+            g_ortho = X
+
+            red_dim = -2 if p.shape[-1] >= p.shape[-2] else -1
+            v_mean = jnp.mean(jnp.square(g_ortho), axis=red_dim, keepdims=True)
+            red_dim_size = g_ortho.shape[red_dim]
+            v_norm_sq = jnp.sum(v_mean, axis=(-2, -1), keepdims=True) * red_dim_size
+            v_norm = jnp.sqrt(v_norm_sq)
+
+            muon_v2_new = muon_v2 * beta2 + v_mean * (1.0 - beta2)
+
+            step_size = jax.lax.rsqrt(jnp.maximum(muon_v2_new, 1e-10))
+            scaled_sq_sum = (v_mean * red_dim_size) * jnp.square(
+                step_size.astype(jnp.float32)
+            )
+            v_norm_new = jnp.sqrt(jnp.sum(scaled_sq_sum, axis=(-2, -1), keepdims=True))
+
+            final_scale = step_size * (v_norm / jnp.maximum(v_norm_new, 1e-10))
+            g_final = (g_ortho * final_scale).astype(p.dtype)
+
+            lr = MATRIX_LR * max(1.0, p.shape[-1] / p.shape[-2]) ** 0.5 * lrm
+
+            mask = (g_final * p) >= 0
+            p_new = p - lr * g_final - lr * wd * p * mask
+            return p_new, adam_m, adam_v, muon_m_new, muon_v2_new
+        else:
+            beta1, beta2 = ADAM_BETAS
+            eps = 1e-10
+
+            if "lm_head" in path_str:
+                lr = UNEMBEDDING_LR * dmodel_lr_scale * lrm
+            else:
+                lr = EMBEDDING_LR * dmodel_lr_scale * lrm
+
+            adam_m_new = beta1 * adam_m + (1.0 - beta1) * g
+            adam_v_new = beta2 * adam_v + (1.0 - beta2) * jnp.square(g)
+
+            m_hat = adam_m_new / (1.0 - beta1**step)
+            v_hat = adam_v_new / (1.0 - beta2**step)
+
+            p_new = p - lr * m_hat / (jnp.sqrt(v_hat) + eps)
+            return p_new, adam_m_new, adam_v_new, muon_m, muon_v2
+
+    out_tree = jax.tree_util.tree_map_with_path(
+        update_leaf,
+        params,
+        grads,
+        state["adamw_exp_avg"],
+        state["adamw_exp_avg_sq"],
+        state["muon_momentum_buffer"],
+        state["muon_second_momentum_buffer"],
     )
-    
+
+    new_params = jax.tree_util.tree_map(lambda x: x[0], out_tree)
+    new_adam_m = jax.tree_util.tree_map(lambda x: x[1], out_tree)
+    new_adam_v = jax.tree_util.tree_map(lambda x: x[2], out_tree)
+    new_muon_m = jax.tree_util.tree_map(lambda x: x[3], out_tree)
+    new_muon_v2 = jax.tree_util.tree_map(lambda x: x[4], out_tree)
+
     new_state = {
         "step": step,
-        "exp_avg": new_m,
-        "exp_avg_sq": new_v,
+        "adamw_exp_avg": new_adam_m,
+        "adamw_exp_avg_sq": new_adam_v,
+        "muon_momentum_buffer": new_muon_m,
+        "muon_second_momentum_buffer": new_muon_v2,
     }
     return new_params, new_state
 
@@ -379,8 +476,10 @@ def train_step_accum(
     state,
     x_batch,
     y_batch,
-    lr,
+    lrm,
+    muon_momentum,
     wd,
+    dmodel_lr_scale,
     grad_accum_steps,
 ):
     zero_grads = jax.tree_util.tree_map(jnp.zeros_like, params)
@@ -404,8 +503,8 @@ def train_step_accum(
         unroll=1,
     )
 
-    new_params, new_state = adamw_step(
-        params, final_grads, state, lr, wd, beta1=ADAM_BETAS[0], beta2=ADAM_BETAS[1]
+    new_params, new_state = muon_adamw_step(
+        params, final_grads, state, lrm, muon_momentum, wd, dmodel_lr_scale
     )
 
     return new_params, new_state, total_loss / grad_accum_steps
@@ -475,7 +574,7 @@ if __name__ == "__main__":
     variables = model.init(rng, dummy_idx)
     params = variables["params"]
 
-    opt_state = init_adamw_state(params)
+    opt_state = init_optimizer_state(params)
 
     # param counts
     def count_params(tree):
@@ -511,8 +610,12 @@ if __name__ == "__main__":
             cooldown = (1.0 - progress) / WARMDOWN_RATIO
             return cooldown * 1.0 + (1 - cooldown) * FINAL_LR_FRAC
 
+    def get_muon_momentum(step):
+        frac = min(step / 300, 1.0)
+        return (1.0 - frac) * 0.85 + frac * 0.95
+
     def get_weight_decay(progress):
-        return WEIGHT_DECAY * (1 - progress)
+        return WEIGHT_DECAY * (1.0 - progress)
 
     t_start_training = time.time()
     smooth_train_loss = 0
@@ -520,6 +623,7 @@ if __name__ == "__main__":
     step = 0
     t0 = time.time()
     dt = 0
+    dmodel_lr_scale = (config.n_embd / 768) ** -0.5
 
     # We buffer grad accum batches in NumPy, then send to JAX
     x_batch_np = np.zeros(
@@ -540,16 +644,19 @@ if __name__ == "__main__":
 
         progress = min(total_training_time / TIME_BUDGET, 1.0)
         lrm = get_lr_multiplier(progress)
-        lr = BASE_LR * lrm
+        muon_momentum = get_muon_momentum(step)
         wd = get_weight_decay(progress)
+        dmodel_lr_scale_arr = jnp.array(dmodel_lr_scale, dtype=jnp.float32)
 
         params, opt_state, train_loss = train_step_accum(
             params,
             opt_state,
             x_jax,
             y_jax,
-            jnp.array(lr),
-            jnp.array(wd),
+            jnp.array(lrm, dtype=jnp.float32),
+            jnp.array(muon_momentum, dtype=jnp.float32),
+            jnp.array(wd, dtype=jnp.float32),
+            dmodel_lr_scale_arr,
             grad_accum_steps,
         )
 
@@ -581,7 +688,7 @@ if __name__ == "__main__":
         remaining = max(0, TIME_BUDGET - total_training_time)
 
         print(
-            f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lr: {lr:.4f} | dt: {dt * 1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ",
+            f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.4f} | dt: {dt * 1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ",
             end="",
             flush=True,
         )
