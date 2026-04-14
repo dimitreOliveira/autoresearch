@@ -113,15 +113,14 @@ colab-tpu-jax = [
     { name = "flax", version = "0.11.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "google-genai" },
     { name = "jax", extra = ["tpu"] },
-    { name = "kernels" },
     { name = "matplotlib" },
-    { name = "optax" },
     { name = "pandas", version = "2.3.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "pandas", version = "3.0.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "pyarrow" },
     { name = "requests" },
     { name = "rustbpe" },
     { name = "tiktoken" },
+    { name = "torch" },
 ]
 
 [package.metadata]
@@ -134,11 +133,9 @@ requires-dist = [
     { name = "jax", extras = ["tpu"], marker = "extra == 'colab-tpu-jax'", specifier = ">=0.4.30" },
     { name = "kernels", marker = "extra == 'colab-pytorch-gpu'" },
     { name = "kernels", marker = "extra == 'colab-pytorch-tpu'" },
-    { name = "kernels", marker = "extra == 'colab-tpu-jax'" },
     { name = "matplotlib", marker = "extra == 'colab-pytorch-gpu'" },
     { name = "matplotlib", marker = "extra == 'colab-pytorch-tpu'" },
     { name = "matplotlib", marker = "extra == 'colab-tpu-jax'" },
-    { name = "optax", marker = "extra == 'colab-tpu-jax'", specifier = ">=0.2.0" },
     { name = "pandas", marker = "extra == 'colab-pytorch-gpu'" },
     { name = "pandas", marker = "extra == 'colab-pytorch-tpu'" },
     { name = "pandas", marker = "extra == 'colab-tpu-jax'" },
@@ -157,6 +154,7 @@ requires-dist = [
     { name = "tiktoken", marker = "extra == 'colab-tpu-jax'" },
     { name = "torch", marker = "extra == 'colab-pytorch-gpu'", specifier = ">=2.0.0" },
     { name = "torch", marker = "extra == 'colab-pytorch-tpu'", specifier = ">=2.0.0" },
+    { name = "torch", marker = "extra == 'colab-tpu-jax'", specifier = ">=2.0.0" },
     { name = "torch-xla", extras = ["tpu"], marker = "extra == 'colab-pytorch-tpu'", specifier = ">=2.5.0" },
     { name = "ty", specifier = ">=0.0.28" },
 ]

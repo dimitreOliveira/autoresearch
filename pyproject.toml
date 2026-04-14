@@ -41,17 +41,17 @@ colab_pytorch_tpu = [
 ]
 
 colab_tpu_jax = [
+    "torch>=2.0.0",
     "jax[tpu]>=0.4.30",
     "flax>=0.8.0",
-    "optax>=0.2.0",
     "rustbpe",
     "tiktoken",
     "pyarrow",
     "requests",
     "google-genai",
-    "kernels",
     "matplotlib",
     "pandas",
+
 ]
 
 [tool.setuptools]
