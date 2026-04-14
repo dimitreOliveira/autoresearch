@@ -79,6 +79,7 @@ The repository also natively supports Google Colab TPUs (e.g. TPU v5e-1, v6e-1) 
 
 - **PyTorch XLA:** Integrates standard PyTorch code utilizing XLA devices (`xm.xla_device()`). It relies on XLA's lazy tracing rather than `torch.compile` to prevent out-of-memory errors on device nodes.
 - **Native bfloat16:** Because TPUs compute natively in `bfloat16`, which retains the dynamic range of `float32`, gradients no longer require a `GradScaler`.
+- **Dynamic Hardware Detection:** Automatically detects TPU topologies and variants (like v2, v5e and v6e Trillium) via environment variables to accurately scale hardware expectations and adjust the `PEAK_FLOPS` for Model Flop Utilization (MFU) metrics.
 - **Reduced Sync Logging:** To avoid pipeline stalls and maximize hardware utilization, XLA graph execution is kept asynchronous by only materializing scalar metrics (like `.item()`) every 10 steps.
 - **System Environment Integration:** `prepare_notebook.py` automatically detects TPU environments and installs dependencies into the system environment to preserve Colab's custom `torch_xla` installation without hiding it under `uv` isolated environments.
 - **Shared prep routines:** The `prepare.py` dataloader script processes dynamic device parameters, allowing the same dataset builder to interface identically onto GPUs and TPUs.
@@ -90,8 +91,9 @@ The repository also natively supports Google Colab TPUs (e.g. TPU v5e-1, v6e-1) 
 In addition to PyTorch, `autoresearch` supports training on Google Colab TPUs using pure JAX and Flax via `train_tpu_jax.py`. Key differences from the PyTorch GPU script include:
 
 - **JAX/Flax Architecture:** The entire model incorporates `flax.linen` layers explicitly, while maintaining exactly numerical and structural parity with the PyTorch ResFormer baseline logic.
-- **Optax Optimizer Setups:** Replicates the custom PyTorch `MuonAdamW` Newton-Schulz logic via strictly stateless functional mappings deployed dynamically against categorical XLA PyTree architectures inside Optax wrappers. 
+- **Custom JAX Optimizer:** Replicates the custom PyTorch `MuonAdamW` Newton-Schulz logic using strictly stateless functional mappings and explicitly managed `jax.tree_util` PyTrees. It avoids external optimizer libraries like Optax to retain complete control over memory layouts and momentum buffers.
 - **JAX Lax Scan:** As opposed to stepping linearly out of a python loop iteratively, XLA natively runs grad accumulation loops embedded explicitly inside `jax.lax.scan()`. This fully insulates compilation bounds eliminating execution lags locally across devices.
+- **Dynamic Hardware Detection:** Integrates environment checks for runtime TPU variants (e.g., v2, v5e, v6e), ensuring accurate `PEAK_FLOPS` initialization for execution and logging MFU on free-tier or allocated TPU VMs.
 - **Dependency Isolation:** Designed natively independent! When using it inside Colab via UV environments, provision its exclusive requirements invoking `uv sync --extra colab_tpu_jax`. 
 
 > **Running the JAX TPU baseline:** To execute the script efficiently via `notebook_runner.ipynb` on Colab, pass the Environment variable `USE_JAX="1"` inside a cell block prior to initialization.
