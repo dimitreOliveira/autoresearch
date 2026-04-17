@@ -16,7 +16,7 @@ url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
 [project.optional-dependencies]
-colab_gpu = [
+colab_pytorch_gpu = [
     "torch>=2.0.0",
     "rustbpe",
     "tiktoken",
@@ -27,7 +27,7 @@ colab_gpu = [
     "matplotlib",
     "pandas",
 ]
-colab_tpu = [
+colab_pytorch_tpu = [
     "torch>=2.0.0",
     "torch_xla[tpu]>=2.5.0",
     "rustbpe",
@@ -38,6 +38,20 @@ colab_tpu = [
     "kernels",
     "matplotlib",
     "pandas",
+]
+
+colab_tpu_jax = [
+    "torch>=2.0.0",
+    "jax[tpu]>=0.4.30",
+    "flax>=0.8.0",
+    "rustbpe",
+    "tiktoken",
+    "pyarrow",
+    "requests",
+    "google-genai",
+    "matplotlib",
+    "pandas",
+
 ]
 
 [tool.setuptools]

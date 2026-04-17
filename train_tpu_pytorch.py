@@ -4,12 +4,9 @@ Cherry-picked and simplified from nanochat.
 Usage: uv run train_tpu_pytorch.py
 """
 
-import os
-
-os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
-
 import gc
 import math
+import os
 import sys
 import time
 from dataclasses import asdict, dataclass
@@ -21,6 +18,12 @@ import torch_xla
 import torch_xla.core.xla_model as xm
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, evaluate_bpb, make_dataloader
+
+# ---------------------------------------------------------------------------
+# Setup
+# ---------------------------------------------------------------------------
+
+os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
 # ---------------------------------------------------------------------------
 # GPT Model

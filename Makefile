@@ -6,4 +6,4 @@ lint:
 	uv run ruff check --select I --fix
 	uv run ruff check --fix
 	uv run ruff format
-	uv run ty check
+	uv run ty check --ignore unresolved-import

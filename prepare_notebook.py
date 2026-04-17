@@ -11,57 +11,41 @@ import os
 import subprocess
 
 
-def check_tpu():
-    """Check if the environment has a TPU available."""
-    # Modern Colab TPU instances
-    if "TPU_ACCELERATOR_TYPE" in os.environ:
-        return os.environ.get("TPU_ACCELERATOR_TYPE")
-
-    # Legacy Colab TPU and Kaggle checks
-    if os.environ.get("COLAB_TPU_ADDR") or os.environ.get("TPU_NAME"):
-        return True
-
-    # TPU VM device file check
-    if os.path.exists("/dev/accel0"):
-        return True
-
-    # Colab internal config
-    try:
-        import json
-
-        with open("/var/colab/env_config.json", "r") as f:
-            if json.load(f).get("accelerator") == "tpu":
-                return True
-    except Exception:
-        pass
-
-    return False
-
-
-def main(repo_dir):
+def main(repo_dir, train_file):
     # Determine the absolute repository directory
     current_repo_dir = os.path.abspath(repo_dir)
 
-    # Determine if we are on a Colab TPU
-    tpu_env = check_tpu()
+    train_file_base = os.path.splitext(os.path.basename(train_file))[0]
 
-    if tpu_env:
+    if train_file_base == "train_tpu_jax":
         print(
-            "TPU runtime detected. Synchronizing dependencies with torch_xla using uv..."
+            "JAX training script detected. Synchronizing dependencies with jax[tpu] using uv..."
         )
         subprocess.run(
-            ["uv", "pip", "install", "--system", ".[colab_tpu]"],
+            ["uv", "pip", "install", "--system", ".[colab_tpu_jax]"],
+            cwd=current_repo_dir,
+            check=True,
+        )
+    elif train_file_base == "train_tpu_pytorch":
+        print(
+            "PyTorch TPU training script detected. Synchronizing dependencies with torch_xla using uv..."
+        )
+        subprocess.run(
+            ["uv", "pip", "install", "--system", ".[colab_pytorch_tpu]"],
+            cwd=current_repo_dir,
+            check=True,
+        )
+    elif train_file_base == "train_gpu_pytorch":
+        print(
+            "PyTorch GPU training script detected. Synchronizing dependencies using uv..."
+        )
+        subprocess.run(
+            ["uv", "sync", "--extra", "colab_pytorch_gpu"],
             cwd=current_repo_dir,
             check=True,
         )
     else:
-        # Sync up dependencies through uv in an isolated venv
-        print("Synchronizing dependencies using uv...")
-        subprocess.run(
-            ["uv", "sync", "--extra", "colab_gpu"],
-            cwd=current_repo_dir,
-            check=True,
-        )
+        raise ValueError(f"Unknown train file: {train_file}")
 
     # Configure Git
     print("Configuring Git bot identity...")
@@ -105,6 +89,12 @@ if __name__ == "__main__":
         default="autoresearch",
         help="The directory to clone the repository into",
     )
+    parser.add_argument(
+        "--train-file",
+        type=str,
+        default="train_gpu_pytorch.py",
+        help="The training file to use, determines dependencies",
+    )
     args = parser.parse_args()
 
-    main(args.repo_dir)
+    main(args.repo_dir, args.train_file)
