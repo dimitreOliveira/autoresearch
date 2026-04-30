@@ -746,3 +746,4 @@ if __name__ == "__main__":
     print(f"num_steps:        {step}")
     print(f"num_params_M:     {num_params / 1e6:.1f}")
     print(f"depth:            {DEPTH}")
+
