@@ -6,6 +6,14 @@
 
 The idea: give an AI agent a small but real LLM training setup and let it experiment autonomously overnight. It modifies the code, trains for 5 minutes, checks if the result improved, keeps or discards, and repeats. You wake up in the morning to a log of experiments and (hopefully) a better model. The training code here is a simplified single-GPU implementation of [nanochat](https://github.com/karpathy/nanochat). The core idea is that you're not touching any of the Python files like you normally would as a researcher. Instead, you are programming the `program.md` Markdown files that provide context to the AI agents and set up your autonomous research org. The default `program.md` in this repo is intentionally kept as a bare bones baseline, though it's obvious how one would iterate on it over time to find the "research org code" that achieves the fastest research progress, how you'd add more agents to the mix, etc. A bit more context on this project is here in this [tweet](https://x.com/karpathy/status/2029701092347630069) and [this tweet](https://x.com/karpathy/status/2031135152349524125).
 
+
+## Relevant link
+
+#### Medium article describing the main parts of the project: [Bringing Karpathy’s Autoresearch to Google Colab, TPUs, and JAX](https://dimitreoliveira.medium.com/bringing-karpathys-autoresearch-to-google-colab-tpus-and-jax-418ba6b7608f)
+
+#### YouTube video going over the details and demoing the project:
+[![Watch the video](https://i.ytimg.com/vi/83gqZVwsFSk/hqdefault.jpg)](https://youtu.be/83gqZVwsFSk)
+
 ## How it works
 
 The repo is deliberately kept small and primarily revolves around these core files:
@@ -97,6 +105,10 @@ In addition to PyTorch, `autoresearch` supports training on Google Colab TPUs us
 - **Dependency Isolation:** Designed natively independent! When using it inside Colab via UV environments, provision its exclusive requirements invoking `uv sync --extra colab_tpu_jax`. 
 
 > **Running the JAX TPU baseline:** To execute the script efficiently via `notebook_runner.ipynb` on Colab, pass the Environment variable `USE_JAX="1"` inside a cell block prior to initialization.
+
+## Acknowledgments
+
+This project was created during the #TPUSprint from the AI GDE (Google Developer Experts) program and Google Cloud credits were provided for it.
 
 ## License
 
